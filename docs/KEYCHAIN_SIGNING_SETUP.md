@@ -17,4 +17,4 @@ For a UI-only preview, run `CLOUDDRIVE_ADHOC_ONLY=1 scripts/build-app.sh`. This 
 
 If certificates exist but are not valid for signing, inspect their validity and chain. Obtain matching public intermediates from [Apple PKI](https://www.apple.com/certificateauthority/) with normal trust; do not mark arbitrary certificates Always Trust or create more leaf certificates as a workaround.
 
-This local development path does not provide notarization, Developer ID distribution or an authenticated updater. Those are separate release tasks.
+Contributor builds use your own development signing identity. You do not need the maintainer’s Developer ID certificate, notarization credentials or Sparkle private key. For public downloads, Developer ID signing, notarization and signed update assets are handled separately; see [release preparation](SPARKLE_RELEASES.md).

@@ -2,7 +2,7 @@
 
 ## Open and build
 
-Open `CloudDrive.xcodeproj` with Xcode and select the CloudDrive scheme and My Mac. `Package.swift` and `swift build` remain supported. Development requires Swift 6 and a macOS SDK. The package minimum is macOS 14; the pinned backend builder currently produces an Apple Silicon executable.
+Open `CloudDrive.xcodeproj` with Xcode and select the CloudDrive scheme and My Mac. `Package.swift` and `swift build` remain supported. Development requires Xcode 26 or later with the macOS 26 SDK; the Liquid Glass UI is availability-gated for older runtime systems. The package minimum is macOS 14; the pinned backend builder currently produces an Apple Silicon executable.
 
 Build the backend with `python3 scripts/build-rclone-allocation.py`. It downloads and hash-checks the sources listed in `vendor/RCLONE_BUILD.json`, applies the patches and writes `build/backend/rclone`, matching notices and `backend-source.tar.gz`. The pinned license collector uses the same Go toolchain; corresponding sources include vendored dependencies for an offline module rebuild. It builds dependencies in a private temporary directory and removes that directory afterward. Build output is ignored by Git.
 
@@ -36,7 +36,7 @@ Workers are copied to private `Application Support/BucketDrive/Workers/<SHA-256>
 
 Recovery uses the private session record, exact process UID/start time/path, authenticated control PID, destination/cache binding and recorded NFS filesystem/port. It does not compare a running worker to the new app's bundled backend. This also permits recovery of legacy workers launched from older app locations. Interrupted launches without a recorded process start identity still require their launch digest to match the discovered executable. Ended sessions can be retired after validating the destination, PID vacancy and mount provenance even when the old binary no longer exists.
 
-Sparkle installation remains gated on safe ejection and worker exit. This source-only project does not update the installed app automatically.
+Sparkle installation remains gated on safe ejection and worker exit. Local source builds do not replace or update an installed release automatically.
 
 ## Tests and qualification
 

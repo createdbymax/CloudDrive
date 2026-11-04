@@ -1,6 +1,6 @@
 # Current limitations
 
-CloudDrive is an early development app for one owner, one R2 connection and one actively writing Mac.
+CloudDrive is an early development app for one user, one R2 connection and one actively writing Mac.
 
 - Writes stage the complete file locally before cloud upload. Large copies can require their full size in temporary space. Cache size/reserve targets are soft limits for active/dirty data, not hard quotas.
 - Eligible uploaded/read cache data is automatically reclaimed. Metadata, active reads and pending uploads still use local storage. Originals outside the drive remain unchanged.

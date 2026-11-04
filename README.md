@@ -10,9 +10,15 @@ Connect a dedicated bucket prefix, copy files using Finder, and watch uploads fr
 
 Download the signed and notarized Apple Silicon app from [GitHub Releases](https://github.com/createdbymax/CloudDrive/releases/latest). Requires macOS 14 or later. Unzip CloudDrive, move it to Applications, and open it. This is an experimental release; keep originals and use a dedicated test prefix. Intel Macs are not supported by this build.
 
+## Contributing
+
+I'd love for CloudDrive to become a community project. Bug reports, ideas, docs, accessibility fixes, and code are all welcome—even small things help.
+
+Have a look at the [contribution guide](CONTRIBUTING.md) or [open an issue](https://github.com/createdbymax/CloudDrive/issues/new/choose). You can build a UI preview and run the tests without an R2 account or a signing certificate. If you're not sure where to start, ask in an issue.
+
 ## Development
 
-Requirements: an Apple Silicon Mac running macOS 14 or later, Xcode with Swift 6, Python 3, and internet access for the initial backend build. The current pinned backend build targets `darwin/arm64`.
+Requirements: an Apple Silicon Mac that can run Xcode 26 or later (including the macOS 26 SDK), Python 3, and internet access for the initial backend build. The app itself supports macOS 14 or later. The current pinned backend build targets `darwin/arm64`.
 
 Open **`CloudDrive.xcodeproj`** in Xcode, choose the **CloudDrive** scheme and **My Mac**, then press **⌘R** to build and run the complete app. First build the backend once using the command below and follow [signing setup](docs/KEYCHAIN_SIGNING_SETUP.md). Xcode builds both native Swift targets, bundles the backend/helper/notices and applies the same stable signing checks as the command-line packager. Use Product → Show Build Folder in Finder to locate the built app under `Products/Debug/CloudDrive.app`.
 
