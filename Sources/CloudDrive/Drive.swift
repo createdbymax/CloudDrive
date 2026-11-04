@@ -63,7 +63,7 @@ import Darwin
         self.fixtureUploadLimitMiB = fixtureUploadLimitMiB
         self.useKeychain = useKeychain
         if useKeychain { self.uploadLimit = UploadLimit(rawValue: UserDefaults.standard.integer(forKey: "uploadLimitMbps")) ?? .unlimited }
-        if autoRecover { Task { [weak self] in await self?.recover() } }
+        if autoRecover { Task { [weak self] in await self?.recover(connectSavedDrive: true) } }
     }
     deinit { polling?.cancel(); operation?.cancel() }
     func openDrive() { if mounted { NSWorkspace.shared.open(mountpoint) } }
@@ -120,7 +120,8 @@ import Darwin
         }
     }
 
-    func recover() async {
+    func recover(connectSavedDrive: Bool = false) async {
+        var loadedSavedConnection = false
         await perform { [self] in
             generation = UUID(); uploadProgress = nil; polling?.cancel(); polling = nil
             mountState = .checking; uploads = .unknown; detail = ""
@@ -132,7 +133,10 @@ import Darwin
             }
             if useKeychain {
                 do {
-                    if let saved = try await Credentials.loadBounded() { connection = saved; keychainNeedsApproval = false }
+                    if let saved = try await Credentials.loadBounded() {
+                        connection = saved; keychainNeedsApproval = false
+                        loadedSavedConnection = true
+                    }
                 } catch {
                     keychainNeedsApproval = true
                     operationResult = safeMessage(error)
@@ -244,6 +248,11 @@ import Darwin
             mountState = mounted ? .connected : .unmounted
             operationResult = mounted ? "Recovered the verified storage worker and Finder mount." : "Recovered the verified worker. Eject to drain and stop it before connecting again."
             beginPolling()
+        }
+        // Startup first adopts any existing worker. Only a saved destination and
+        // successful recovery may start a new one; an empty setup stays idle.
+        if connectSavedDrive && loadedSavedConnection && !lastOperationFailed && canConnect {
+            await start()
         }
     }
 

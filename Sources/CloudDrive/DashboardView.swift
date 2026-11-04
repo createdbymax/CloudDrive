@@ -5,27 +5,26 @@ struct ContentView: View {
     @ObservedObject var drive: Drive
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                HStack(spacing: 10) {
-                    Image(systemName: "externaldrive")
-                        .font(.system(size: 23, weight: .light))
-                        .frame(width: 48, height: 48)
-                        .background(LinearGradient(colors: [.primary.opacity(0.09), .primary.opacity(0.02)], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 13))
-                        .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(.primary.opacity(0.1)))
+            VStack(alignment: .leading, spacing: 20) {
+                HStack(spacing: 12) {
+                    Image(systemName: "externaldrive.fill")
+                        .font(.system(size: 28, weight: .regular))
+                        .foregroundStyle(.secondary)
                         .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("CloudDrive").font(.system(size: 19, weight: .semibold)).tracking(-0.5)
-                        Text("R2 DRIVE").font(.system(size: 9, weight: .medium, design: .monospaced))
-                            .tracking(1.5).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("CloudDrive").font(.title3.weight(.semibold))
+                        Text("Cloudflare R2").font(.subheadline).foregroundStyle(.secondary)
                     }
-                    Spacer()
+                    Spacer(minLength: 16)
                     if !drive.needsSetup {
                         Button { drive.openDrive() } label: {
-                            HStack(spacing: 7) {
-                                Text("Open in Finder")
-                                Image(systemName: "arrow.up.right").font(.system(size: 9, weight: .semibold))
-                            }.padding(.horizontal, 5).padding(.vertical, 4)
-                        }.disabled(!drive.mounted)
+                            Text("Open in Finder").frame(minHeight: 22)
+                        }
+                            .modifier(DriveButtonAppearance(prominent: true))
+                            .controlSize(.large)
+                            .keyboardShortcut("o", modifiers: .command)
+                            .help("Open in Finder (⌘O)")
+                            .disabled(!drive.mounted)
                     }
                 }
                 if drive.needsSetup {
@@ -44,17 +43,17 @@ struct ContentView: View {
                     if !drive.running && !drive.keychainNeedsApproval {
                         Button("Connect") { Task { await drive.start() } }.disabled(!drive.canConnect)
                     }
-                    StorageSummary(drive: drive)
+                    StorageSummary(drive: drive, compact: true)
                     Divider()
                     DashboardActions(drive: drive)
                 }
             }
-            .padding(24).frame(maxWidth: 640).frame(maxWidth: .infinity)
+            .padding(24).frame(maxWidth: 560).frame(maxWidth: .infinity)
         }
-        .font(.system(size: 12))
-        .buttonStyle(.bordered).controlSize(.small).tint(.primary)
-        .background(.regularMaterial)
-        .frame(minWidth: 460, minHeight: 350)
+        .font(.body)
+        .modifier(DriveButtonAppearance()).controlSize(.regular)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(minWidth: 440, minHeight: 280)
     }
 }
 
@@ -64,17 +63,22 @@ struct StatusCard: View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             // Evaluate at render time: samples may arrive between timeline ticks.
             let status = drive.presentation(at: Date())
-            VStack(alignment: .leading, spacing: 8) {
-                Label(status.title, systemImage: status.symbol)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(status.tone == .attention ? Color.orange : Color.primary)
-                Text(status.subtitle)
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true).lineSpacing(3)
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: status.symbol)
+                    .font(.system(size: 16))
+                    .foregroundStyle(status.tone == .attention ? Color.orange : Color.secondary)
+                    .frame(width: 20, height: 20)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(status.title == "Connected · No uploads waiting" ? "Connected" : status.title)
+                        .font(.headline)
+                    Text(status.title == "Connected · No uploads waiting" ? "No uploads waiting" : status.subtitle)
+                        .font(.subheadline).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
-            .padding(16).frame(maxWidth: .infinity, alignment: .leading)
-            .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
-            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.primary.opacity(0.07)))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 4)
         }
     }
 }
@@ -96,22 +100,37 @@ struct OperationFeedback: View {
 
 struct StorageSummary: View {
     @ObservedObject var drive: Drive
+    var compact = false
+    @State private var detailsExpanded = false
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("Storage", systemImage: "cloud").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                Spacer()
-                if drive.running && drive.automaticSpaceSaving {
-                    Text("AUTO").font(.system(size: 9, weight: .medium, design: .monospaced)).tracking(1)
-                        .foregroundStyle(.secondary).padding(.horizontal, 7).padding(.vertical, 3)
-                        .background(.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 5))
-                        .accessibilityLabel("Automatic space saving is on")
+        if compact {
+            DisclosureGroup(isExpanded: $detailsExpanded) {
+                details.padding(.top, 8)
+            } label: {
+                HStack {
+                    Text("Local storage")
+                    Spacer()
+                    Text(drive.running && drive.automaticSpaceSaving ? "Automatic" : "Details")
+                        .foregroundStyle(.secondary)
                 }
             }
-            Text(drive.storagePolicyText).font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(3)
-            Text("Uncached files need internet. Uploads and active reads use temporary local space.")
-                .font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(2)
+            .font(.subheadline)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Local storage").font(.headline)
+                details
+            }
         }
+    }
+
+    private var details: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(drive.storagePolicyText)
+            Text("Uncached files need internet. Uploads and active reads use temporary local space.")
+        }
+        .font(.subheadline).foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -119,13 +138,26 @@ struct DashboardActions: View {
     @ObservedObject var drive: Drive
     @Environment(\.openWindow) private var openWindow
     var body: some View {
-        HStack(spacing: 18) {
-            SettingsLink { Label("Settings", systemImage: "gearshape") }
-            Button { openWindow(id: "recovery") } label: { Label("Recovery", systemImage: "arrow.counterclockwise") }
+        Group {
+            if #available(macOS 26.0, *) {
+                GlassEffectContainer(spacing: 4) { actions }
+            } else {
+                actions
+            }
+        }
+        .modifier(DriveButtonAppearance())
+        .controlSize(.large)
+        .font(.body)
+    }
+
+    private var actions: some View {
+        HStack(spacing: 8) {
+            SettingsLink { Label("Settings", systemImage: "gearshape").frame(minHeight: 18) }
+            Button { openWindow(id: "recovery") } label: { Label("Recovery", systemImage: "arrow.counterclockwise").frame(minHeight: 18) }
             Spacer()
-            Button { Task { await drive.eject() } } label: { Label("Eject", systemImage: "eject") }
+            Button { Task { await drive.eject() } } label: { Label("Eject", systemImage: "eject").frame(minHeight: 18) }
                 .disabled(!drive.canEject)
-        }.buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(.secondary)
+        }
     }
 }
 
@@ -152,6 +184,26 @@ struct CompactTransfers: View {
             }
             Button("Show transfers") { openWindow(id: "transfers") }
         }
+        }
+    }
+}
+
+/// Native Liquid Glass on supported systems, with the existing macOS 14–25 appearance.
+private struct DriveButtonAppearance: ViewModifier {
+    var prominent = false
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            if prominent {
+                content.buttonStyle(.glassProminent)
+            } else {
+                content.buttonStyle(.glass)
+            }
+        } else if prominent {
+            content.buttonStyle(.borderedProminent)
+        } else {
+            content.buttonStyle(.bordered)
         }
     }
 }

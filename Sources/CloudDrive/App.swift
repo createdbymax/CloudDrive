@@ -30,8 +30,7 @@ import AppKit
     var body: some Scene {
         Window("CloudDrive", id: "dashboard") {
             ContentView(drive: delegate.drive)
-        }.defaultSize(width: 520, height: 420)
-        .windowStyle(.hiddenTitleBar)
+        }.defaultSize(width: 480, height: 310)
         .commands { CommandGroup(after: .appInfo) { UpdateMenu(updates: delegate.updates) } }
         Window("Transfers", id: "transfers") {
             TransfersView(drive: delegate.drive)

@@ -7,6 +7,17 @@ import CryptoKit
 @MainActor final class DriveLifecycleTests: XCTestCase {
     private var project: URL { URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent() }
 
+    func testStartupWithoutSavedDriveStaysDisconnected() async throws {
+        let f = try fixture(), drive = f.controller()
+        await drive.recover(connectSavedDrive: true)
+        XCTAssertTrue(drive.canConnect, drive.operationResult)
+        XCTAssertEqual(drive.mountState, .disconnected)
+        XCTAssertFalse(drive.running)
+        XCTAssertFalse(drive.lastOperationFailed, drive.operationResult)
+        XCTAssertNil(try WorkerRecordStore(directory: f.root).load())
+        XCTAssertNil(try WorkerRecordStore(directory: f.root).loadIntent())
+    }
+
     private func fixture() throws -> Fixture {
         let requestedRoot = FileManager.default.temporaryDirectory.appendingPathComponent("clouddrive-m1-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: requestedRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
