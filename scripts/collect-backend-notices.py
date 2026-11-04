@@ -48,6 +48,8 @@ def collect(go, source, backend, output):
         with (output/'LICENSES.csv').open('w') as f:
             writer = csv.writer(f); writer.writerow(['library', 'upstream_license_url', 'license']); writer.writerows(rows)
     shutil.copy2(go.parent.parent/'LICENSE', output/'GO-TOOLCHAIN-LICENSE.txt')
+    for name in ['GPL-3.0.txt', 'LGPL-3.0.txt']:
+        shutil.copy2(ROOT/'vendor'/name, output/name)
     shutil.copy2(ROOT/'vendor/THIRD_PARTY_CHANGES.md', output/'BACKEND_CHANGES.md')
     (output/'README.txt').write_text(
         'CloudDrive backend third-party notices\n\n'
@@ -63,6 +65,8 @@ def collect(go, source, backend, output):
     source_archive = output.parent/'backend-source.tar.gz'
     with tempfile.TemporaryDirectory(prefix='clouddrive-source-notice-') as temporary:
         extra = Path(temporary)
+        for name in ['GPL-3.0.txt', 'LGPL-3.0.txt']:
+            shutil.copy2(ROOT/'vendor'/name, extra/name)
         shutil.copy2(ROOT/'vendor/RCLONE_BUILD.json', extra/'RCLONE_BUILD.json')
         shutil.copy2(ROOT/'vendor/THIRD_PARTY_CHANGES.md', extra/'THIRD_PARTY_CHANGES.md')
         shutil.copytree(ROOT/'vendor/patches', extra/'patches')

@@ -29,6 +29,8 @@ def validate_backend_notices(backend):
     manifest = json.loads((notices/'MANIFEST.json').read_text())
     if hashlib.sha256(backend.read_bytes()).hexdigest() != manifest['backendSHA256']:
         raise RuntimeError('Backend notices do not match this executable. Rebuild the backend.')
+    if not {'GPL-3.0.txt', 'LGPL-3.0.txt'}.issubset(manifest['files']):
+        raise RuntimeError('Required GNU license materials are missing. Rebuild the backend notices.')
     for name, digest in manifest['files'].items():
         if pathlib.PurePosixPath(name).is_absolute() or '..' in pathlib.PurePosixPath(name).parts:
             raise RuntimeError('Invalid backend notice path.')

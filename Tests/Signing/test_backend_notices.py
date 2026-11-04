@@ -23,6 +23,9 @@ class BackendNoticeTests(unittest.TestCase):
         (self.notices/'LICENSE').write_text('synthetic fixture notice')
         self.manifest = {'backendSHA256': self.sha(self.backend),
                          'files': {'LICENSE': self.sha(self.notices/'LICENSE')}}
+        for name in ['GPL-3.0.txt', 'LGPL-3.0.txt']:
+            (self.notices/name).write_text('synthetic fixture license text')
+            self.manifest['files'][name] = self.sha(self.notices/name)
         self.save()
 
     def sha(self, path):
@@ -45,11 +48,16 @@ class BackendNoticeTests(unittest.TestCase):
             package_app.validate_backend_notices(self.backend)
 
     def test_manifest_cannot_reference_files_outside_bundle(self):
-        self.manifest['files'] = {'../rclone': self.sha(self.backend)}; self.save()
+        self.manifest['files']['../rclone'] = self.sha(self.backend); self.save()
         with self.assertRaisesRegex(RuntimeError, 'Invalid backend notice path'):
             package_app.validate_backend_notices(self.backend)
 
     def test_missing_notice_blocks_packaging(self):
         (self.notices/'LICENSE').unlink()
         with self.assertRaises(FileNotFoundError):
+            package_app.validate_backend_notices(self.backend)
+
+    def test_manifest_must_include_required_gnu_licenses(self):
+        del self.manifest['files']['GPL-3.0.txt']; self.save()
+        with self.assertRaisesRegex(RuntimeError, 'Required GNU license materials'):
             package_app.validate_backend_notices(self.backend)
