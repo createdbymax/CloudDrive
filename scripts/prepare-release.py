@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -70,6 +71,12 @@ def main():
     archive = output/f'CloudDrive-{args.version}-{args.build}-arm64.zip'
     if archive.exists():
         parser.error('Archive already exists; preserve release immutability by using a new build.')
+    backend = Path(os.environ.get('CLOUDDRIVE_BACKEND', str(ROOT/'build/backend/rclone')))
+    source_archive = backend.parent/'backend-source.tar.gz'
+    notice_manifest = json.loads((app/'Contents/Resources/BackendNotices/MANIFEST.json').read_text())
+    if hashlib.sha256(source_archive.read_bytes()).hexdigest() != notice_manifest['sourceArchiveSHA256']:
+        parser.error('Corresponding backend source does not match the packaged notices.')
+    shutil.copy2(source_archive, output/'backend-source.tar.gz')
     tools = ROOT/'.build/artifacts/sparkle/Sparkle/bin'
     if not args.draft:
         # Notarization submits externally and is deliberately a separate, explicit operation.
@@ -105,7 +112,7 @@ def main():
     ET.indent(rss)
     feed_file = output/('appcast.preview.xml' if args.draft else 'appcast.xml')
     ET.ElementTree(rss).write(feed_file, encoding='utf-8', xml_declaration=True)
-    (output/'SHA256SUMS').write_text(hashlib.sha256(archive.read_bytes()).hexdigest()+'  '+archive.name+'\n')
+    (output/'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in [archive, output/'backend-source.tar.gz']))
     (output/'PREPARATION.json').write_text(json.dumps({'draft': args.draft, 'repository': args.repository,
         'tag': tag, 'build': args.build, 'published': False}, indent=2)+'\n')
     print(f'Local assets only: {output}')

@@ -24,13 +24,30 @@ def check_inactive(app):
         raise RuntimeError('This build is active. Eject its drive and quit it before rebuilding.')
 
 
+def validate_backend_notices(backend):
+    notices = backend.parent/'backend-notices'
+    manifest = json.loads((notices/'MANIFEST.json').read_text())
+    if hashlib.sha256(backend.read_bytes()).hexdigest() != manifest['backendSHA256']:
+        raise RuntimeError('Backend notices do not match this executable. Rebuild the backend.')
+    for name, digest in manifest['files'].items():
+        if pathlib.PurePosixPath(name).is_absolute() or '..' in pathlib.PurePosixPath(name).parts:
+            raise RuntimeError('Invalid backend notice path.')
+        if hashlib.sha256((notices/name).read_bytes()).hexdigest() != digest:
+            raise RuntimeError('Backend notice checksum mismatch.')
+    return notices
+
+
 def package(app, products, backend):
     metadata = update_metadata(configured_environment(os.environ))
     check_inactive(app)
     if not backend.is_file() or not os.access(backend, os.X_OK):
         raise RuntimeError('Build the backend first: python3 scripts/build-rclone-allocation.py')
+    notices = validate_backend_notices(backend)
     resources = app/'Contents/Resources'
     resources.mkdir(parents=True, exist_ok=True)
+    notice_target = resources/'BackendNotices'
+    if notice_target.exists():shutil.rmtree(notice_target)
+    shutil.copytree(notices, notice_target)
     (app/'Contents/MacOS').mkdir(parents=True, exist_ok=True)
     subprocess.run([sys.executable, str(ROOT/'scripts/build-icon.py')], check=True)
     shutil.copy2(ROOT/'build/icons/CloudDrive.icns', resources/'CloudDrive.icns')
@@ -65,8 +82,8 @@ def package(app, products, backend):
         shutil.copytree(framework, destination, symlinks=True)
     license_file = ROOT/'vendor/SPARKLE-LICENSE.txt'
     shutil.copy2(license_file, resources/license_file.name)
-    version = os.environ.get('CLOUDDRIVE_APP_VERSION', '0.5.5')
-    build = os.environ.get('CLOUDDRIVE_APP_BUILD', '14')
+    version = os.environ.get('CLOUDDRIVE_APP_VERSION', '0.5.7')
+    build = os.environ.get('CLOUDDRIVE_APP_BUILD', '18')
     if not re.fullmatch(r'\d+\.\d+\.\d+', version) or not re.fullmatch(r'\d+(?:\.\d+){0,2}', build):
         raise RuntimeError('App version/build must contain numeric components.')
     plist = {'CFBundleExecutable': 'CloudDrive', 'CFBundleIdentifier': signing.APP_ID,
@@ -80,7 +97,10 @@ def package(app, products, backend):
     files = sorted([*ROOT.glob('Sources/**/*.swift'), *ROOT.glob('Assets/*.png'), *ROOT.glob('scripts/*.*'),
                     *ROOT.glob('vendor/patches/*.patch'), ROOT/'vendor/RCLONE_BUILD.json',
                     ROOT/'release-config.json', ROOT/'Package.resolved', ROOT/'Package.swift', *ROOT.glob('CloudDrive.xcodeproj/project.pbxproj')])
-    info = {'version': version, 'build': build,
+    source_commit = os.environ.get('CLOUDDRIVE_SOURCE_COMMIT')
+    if source_commit is not None and not re.fullmatch(r'[a-f0-9]{40}', source_commit):
+        raise RuntimeError('Source commit must be a full Git SHA.')
+    info = {'version': version, 'build': build, 'sourceCommit': source_commit,
             'builtAtUTC': datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'sources': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
             'rcloneSHA256': hashlib.sha256((resources/'rclone').read_bytes()).hexdigest()}

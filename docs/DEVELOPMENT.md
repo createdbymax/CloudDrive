@@ -4,7 +4,7 @@
 
 Open `CloudDrive.xcodeproj` with Xcode and select the CloudDrive scheme and My Mac. `Package.swift` and `swift build` remain supported. Development requires Swift 6 and a macOS SDK. The package minimum is macOS 14; the pinned backend builder currently produces an Apple Silicon executable.
 
-Build the backend with `python3 scripts/build-rclone-allocation.py`. It downloads and hash-checks the sources listed in `vendor/RCLONE_BUILD.json`, applies the patches and writes `build/backend/rclone`. It builds dependencies in a private temporary directory and removes that directory afterward. Build output is ignored by Git.
+Build the backend with `python3 scripts/build-rclone-allocation.py`. It downloads and hash-checks the sources listed in `vendor/RCLONE_BUILD.json`, applies the patches and writes `build/backend/rclone`, matching notices and `backend-source.tar.gz`. The pinned license collector uses the same Go toolchain; corresponding sources include vendored dependencies for an offline module rebuild. It builds dependencies in a private temporary directory and removes that directory afterward. Build output is ignored by Git.
 
 Run `scripts/build-app.sh` to package a certificate-signed app. Packaging copies and signs the backend/helper, seals resources, records source hashes and checks signing continuity. Stop the app process before rebuilding its output package. Workers launched by this version run from private, versioned copies outside the bundle, so an Xcode stop/rebuild/run can recover the existing drive without stopping uploads. Packaging still refuses to overwrite a running app, helper, or legacy worker inside the output bundle.
 

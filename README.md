@@ -6,6 +6,10 @@ Connect a dedicated bucket prefix, copy files using Finder, and watch uploads fr
 
 **Early development software.** The current app stages a whole file locally before uploading it. Deleting a file deletes its remote object; trash and version recovery are not implemented. Keep originals and use a dedicated test prefix. See [current limitations](docs/LIMITATIONS.md).
 
+## Download
+
+Download the signed and notarized Apple Silicon app from [GitHub Releases](https://github.com/createdbymax/CloudDrive/releases/latest). Requires macOS 14 or later. Unzip CloudDrive, move it to Applications, and open it. This is an experimental release; keep originals and use a dedicated test prefix. Intel Macs are not supported by this build.
+
 ## Development
 
 Requirements: an Apple Silicon Mac running macOS 14 or later, Xcode with Swift 6, Python 3, and internet access for the initial backend build. The current pinned backend build targets `darwin/arm64`.
@@ -25,7 +29,7 @@ swift build
 ./scripts/build-app.sh
 ```
 
-The first backend build downloads a pinned Go toolchain, rclone and go-nfs, verifies their hashes, applies the allocation patches and builds `build/backend/rclone`. It may take several minutes and use substantial temporary disk space. No backend executable is tracked in the source repository.
+The first backend build downloads a pinned Go toolchain, rclone and go-nfs, verifies their hashes, applies the allocation patches and builds `build/backend/rclone`. It also collects dependency notices and creates a vendored backend source archive for redistribution. It may take several minutes and use substantial temporary disk space. No backend executable is tracked in the source repository.
 
 The packaged app is `build/CloudDrive.app`. CloudDrive was previously named BucketDrive; existing credential and state identifiers are retained for [upgrade compatibility](docs/DEVELOPMENT.md#rename-compatibility). Follow [signing setup](docs/KEYCHAIN_SIGNING_SETUP.md) before using saved connections. An ad-hoc preview can compile the UI, but cannot save or migrate credentials; normal app use requires certificate signing.
 

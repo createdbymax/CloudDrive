@@ -82,11 +82,11 @@ common = dict(ALWAYS_SEARCH_USER_PATHS='NO', ARCHS='arm64', ONLY_ACTIVE_ARCH='YE
               CLOUDDRIVE_ADHOC_ONLY='0', CLOUDDRIVE_SIGN_IDENTITY='',
               CLOUDDRIVE_BACKEND='$(SRCROOT)/build/backend/rclone',
               CLOUDDRIVE_SPARKLE_FEED_URL='', CLOUDDRIVE_SPARKLE_PUBLIC_KEY='', CLOUDDRIVE_RELEASE='0',
-              CLOUDDRIVE_APP_VERSION='0.5.5', CLOUDDRIVE_APP_BUILD='14',
+              CLOUDDRIVE_APP_VERSION='0.5.7', CLOUDDRIVE_APP_BUILD='18',
               PRODUCT_NAME='$(TARGET_NAME)', SWIFT_EMIT_LOC_STRINGS='NO')
 app_settings = dict(common, PRODUCT_BUNDLE_IDENTIFIER='local.bucketdrive.app',
-                    GENERATE_INFOPLIST_FILE='YES', INFOPLIST_KEY_CFBundleDisplayName='CloudDrive',
-                    MARKETING_VERSION='0.5.5', CURRENT_PROJECT_VERSION='14',
+                    GENERATE_INFOPLIST_FILE='YES', INFOPLIST_KEY_CFBundleDisplayName='CloudDrive', INFOPLIST_KEY_LSApplicationCategoryType='public.app-category.utilities',
+                    MARKETING_VERSION='0.5.7', CURRENT_PROJECT_VERSION='18',
                     ENABLE_APP_SANDBOX='NO', COMBINE_HIDPI_IMAGES='YES',
                     LD_RUNPATH_SEARCH_PATHS=['$(inherited)', '@executable_path/../Frameworks'])
 sparkle_package = add('sparkle-package', 'XCRemoteSwiftPackageReference', repositoryURL='https://github.com/sparkle-project/Sparkle', requirement={'kind': 'exactVersion', 'version': '2.10.1'})

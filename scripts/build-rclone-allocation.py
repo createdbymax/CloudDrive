@@ -5,7 +5,7 @@ Uses a private temporary toolchain, sources, module/cache directories. It never
 replaces a bundled binary or accesses a drive/profile/bucket. Downloads are
 verified against vendor/RCLONE_BUILD.json before extraction.
 """
-import hashlib, json, os, pathlib, shutil, subprocess, tarfile, tempfile, urllib.request
+import hashlib, json, os, pathlib, shutil, subprocess, sys, tarfile, tempfile, urllib.request
 ROOT=pathlib.Path(__file__).resolve().parent.parent
 INFO=json.loads((ROOT/'vendor/RCLONE_BUILD.json').read_text())
 def sha(path):
@@ -50,11 +50,14 @@ def main():
         go=str(stage/'go/bin/go')
         env={'PATH':str(stage/'go/bin')+':/usr/bin:/bin:/usr/sbin:/sbin','HOME':str(pathlib.Path.home()),
              'GOTOOLCHAIN':'local','GOMAXPROCS':'2','GOPATH':str(stage/'modules'),'GOCACHE':str(stage/'compile-cache'),'CGO_ENABLED':'0'}
-        subprocess.run([go,'mod','edit','-replace','github.com/willscott/go-nfs='+str(stage/'go-nfs')],cwd=stage/'rclone',env=env,check=True)
+        subprocess.run([go,'mod','edit','-replace','github.com/willscott/go-nfs=../go-nfs'],cwd=stage/'rclone',env=env,check=True)
         subprocess.run([go,'test','-p','2','./...','-run','TestOptionalAllocatedBytes','-count=1'],cwd=stage/'go-nfs',env=env,check=True)
         subprocess.run([go,'test','-p','2','./cmd/serve/nfs','./vfs/vfscache','-run','TestAllocation|TestAllocated','-count=1'],cwd=stage/'rclone',env=env,check=True)
         out=ROOT/'build/backend/rclone';out.parent.mkdir(parents=True,exist_ok=True)
         subprocess.run([go,'build','-p','2','-trimpath','-ldflags','-s -w -X github.com/rclone/rclone/fs.Version='+INFO['version'],'-o',str(out),'.'],cwd=stage/'rclone',env=env,check=True)
+        notices=out.parent/'backend-notices'
+        if notices.exists():shutil.rmtree(notices)
+        subprocess.run([sys.executable,str(ROOT/'scripts/collect-backend-notices.py'),'--go',go,'--source',str(stage/'rclone'),'--backend',str(out),'--output',str(notices)],env=env,check=True)
         print(out)
         print('Run qualification before explicitly selecting this backend for packaging.')
     finally:cleanup(stage)
