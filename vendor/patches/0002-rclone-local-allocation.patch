@@ -1,0 +1,297 @@
+--- a/cmd/serve/nfs/filesystem.go
++++ b/cmd/serve/nfs/filesystem.go
+@@ -71,8 +71,9 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	for _, fi := range dir {
++	for i, fi := range dir {
+ 		setSys(fi)
++		dir[i] = withAllocation(fi)
+ 	}
+ 	return dir, nil
+ }
+@@ -107,7 +108,7 @@
+ 		return nil, err
+ 	}
+ 	setSys(fi)
+-	return fi, nil
++	return withAllocation(fi), nil
+ }
+ 
+ // Rename renames a file
+@@ -165,7 +166,7 @@
+ 		return nil, err
+ 	}
+ 	setSys(fi)
+-	return fi, nil
++	return withAllocation(fi), nil
+ }
+ 
+ // Symlink creates a link pointing to target
+--- /dev/null
++++ b/cmd/serve/nfs/allocation_unix.go
+@@ -0,0 +1,36 @@
++//go:build unix
++
++package nfs
++
++import (
++	"github.com/rclone/rclone/vfs"
++	"os"
++)
++
++// allocatedFileInfo adds allocation without changing file size, inode, UID/GID
++// or the node's shared Sys payload. go-nfs reads this optional interface when
++// constructing every NFS attribute response.
++type allocatedFileInfo struct {
++	os.FileInfo
++	allocation func() (uint64, error)
++}
++
++func (info allocatedFileInfo) AllocatedBytes() uint64 {
++	used, err := info.allocation()
++	if err == nil {
++		return used
++	}
++	// NFS has no unknown allocation value. Preserve the upstream conservative
++	// logical-size fallback instead of falsely claiming zero on an error.
++	return uint64(info.FileInfo.Size())
++}
++
++func withAllocation(info os.FileInfo) os.FileInfo {
++	node, ok := info.(*vfs.File)
++	if !ok || !info.Mode().IsRegular() {
++		return info
++	}
++	return allocatedFileInfo{FileInfo: info, allocation: func() (uint64, error) {
++		return node.VFS().CachedAllocatedBytes(node.CachePath())
++	}}
++}
+--- /dev/null
++++ b/cmd/serve/nfs/allocation_unix_test.go
+@@ -0,0 +1,46 @@
++//go:build unix
++
++package nfs
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++
++	gonfs "github.com/willscott/go-nfs"
++)
++
++func TestAllocationPreservesLogicalSizeAndUnknownFallback(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "fixture")
++	if err := os.WriteFile(path, make([]byte, 8192), 0600); err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, test := range []struct {
++		name     string
++		used     uint64
++		err      error
++		expected uint64
++	}{
++		{"cloud-only", 0, nil, 0},
++		{"partially-cached", 4096, nil, 4096},
++		{"pending-upload", 8192, nil, 8192},
++		{"unavailable", 0, errors.New("stat denied"), 8192},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			wrapped := allocatedFileInfo{FileInfo: info, allocation: func() (uint64, error) { return test.used, test.err }}
++			attr := gonfs.ToFileAttribute(wrapped, path)
++			if attr.Filesize != 8192 || attr.Used != test.expected {
++				t.Fatalf("attribute size/used = %d/%d; want8192/%d", attr.Filesize, attr.Used, test.expected)
++			}
++		})
++	}
++	attr := gonfs.ToFileAttribute(info, path)
++	if attr.Used != 8192 {
++		t.Fatalf("unrelated file fallback changed to%d", attr.Used)
++	}
++}
+--- /dev/null
++++ b/vfs/allocation_unix.go
+@@ -0,0 +1,14 @@
++//go:build unix
++
++package vfs
++
++import "fmt"
++
++// CachedAllocatedBytes reports local physical data-cache allocation only. It
++// never creates a cache entry or downloads a remote object.
++func (vfs *VFS) CachedAllocatedBytes(name string) (uint64, error) {
++	if vfs.cache == nil {
++		return 0, fmt.Errorf("local data cache is not configured")
++	}
++	return vfs.cache.AllocatedBytes(name)
++}
+--- /dev/null
++++ b/vfs/vfscache/allocation_unix.go
+@@ -0,0 +1,60 @@
++//go:build unix
++
++package vfscache
++
++import (
++	"fmt"
++	"math"
++	"os"
++	"path/filepath"
++	"strings"
++	"syscall"
++)
++
++// AllocatedBytes reports physical blocks occupied by a cache data file, without
++// opening it, creating a cache item, fetching data, or counting metadata files.
++// An absent data file has no local allocation. Other errors remain errors so a
++// caller cannot accidentally present an unreadable cache as cloud-only.
++func (c *Cache) AllocatedBytes(name string) (uint64, error) {
++	name = clean(name)
++	if name == "" || name == ".." || strings.HasPrefix(name, "../") {
++		return 0, fmt.Errorf("invalid cache allocation path")
++	}
++	candidate := c.toOSPath(name)
++	relative, err := filepath.Rel(c.root, candidate)
++	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
++		return 0, fmt.Errorf("cache allocation path escapes its root")
++	}
++	// Lstat each component rather than following a cache symlink to another
++	// file. A missing component means no data file is allocated locally.
++	current := c.root
++	components := strings.Split(relative, string(filepath.Separator))
++	for i, part := range components {
++		current = filepath.Join(current, part)
++		info, err := os.Lstat(current)
++		if os.IsNotExist(err) {
++			return 0, nil
++		}
++		if err != nil {
++			return 0, err
++		}
++		if info.Mode()&os.ModeSymlink != 0 {
++			return 0, fmt.Errorf("cache allocation path is a symlink")
++		}
++		if i != len(components)-1 {
++			if !info.IsDir() {
++				return 0, fmt.Errorf("cache allocation parent is not a directory")
++			}
++			continue
++		}
++		if !info.Mode().IsRegular() {
++			return 0, fmt.Errorf("cache allocation target is not a regular file")
++		}
++		st, ok := info.Sys().(*syscall.Stat_t)
++		if !ok || st.Blocks < 0 || uint64(st.Blocks) > math.MaxUint64/512 {
++			return 0, fmt.Errorf("cache physical allocation is unavailable")
++		}
++		return uint64(st.Blocks) * 512, nil
++	}
++	return 0, fmt.Errorf("cache allocation target is unavailable")
++}
+--- /dev/null
++++ b/vfs/vfscache/allocation_unix_test.go
+@@ -0,0 +1,95 @@
++//go:build unix
++
++package vfscache
++
++import (
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++)
++
++func TestAllocatedBytesSparseAndAbsent(t *testing.T) {
++	root := t.TempDir()
++	c := &Cache{root: root}
++	used, err := c.AllocatedBytes("absent")
++	if err != nil || used != 0 {
++		t.Fatalf("absent allocation = %d, %v", used, err)
++	}
++	file, err := os.Create(filepath.Join(root, "sparse"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer file.Close()
++	const logical = 64 << 20
++	if err := file.Truncate(logical); err != nil {
++		t.Fatal(err)
++	}
++	before, err := c.AllocatedBytes("sparse")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if before >= logical {
++		t.Fatalf("sparse file was reported fully allocated: %d", before)
++	}
++	if _, err := file.WriteAt(make([]byte, 4096), 32<<20); err != nil {
++		t.Fatal(err)
++	}
++	if err := file.Sync(); err != nil {
++		t.Fatal(err)
++	}
++	info, err := file.Stat()
++	if err != nil {
++		t.Fatal(err)
++	}
++	expected := uint64(info.Sys().(*syscall.Stat_t).Blocks) * 512
++	after, err := c.AllocatedBytes("sparse")
++	if err != nil || after != expected || after == 0 || after >= logical {
++		t.Fatalf("partial physical allocation = %d, want %d (error %v)", after, expected, err)
++	}
++	if err := file.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Remove(filepath.Join(root, "sparse")); err != nil {
++		t.Fatal(err)
++	}
++	used, err = c.AllocatedBytes("sparse")
++	if err != nil || used != 0 {
++		t.Fatalf("evicted allocation = %d, %v", used, err)
++	}
++}
++
++func TestAllocatedBytesRejectsUnsafeOrUnknownTargets(t *testing.T) {
++	root := t.TempDir()
++	c := &Cache{root: root}
++	for _, name := range []string{"", "..", "../outside", "a/../../outside"} {
++		if _, err := c.AllocatedBytes(name); err == nil {
++			t.Fatalf("accepted path %q", name)
++		}
++	}
++	outside := filepath.Join(t.TempDir(), "preserved")
++	if err := os.WriteFile(outside, []byte("preserved"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := c.AllocatedBytes("link"); err == nil {
++		t.Fatal("followed symlink")
++	}
++	if err := os.Symlink(filepath.Dir(outside), filepath.Join(root, "linked-parent")); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := c.AllocatedBytes("linked-parent/preserved"); err == nil {
++		t.Fatal("followed parent symlink")
++	}
++	if err := os.Mkdir(filepath.Join(root, "directory"), 0700); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := c.AllocatedBytes("directory"); err == nil {
++		t.Fatal("reported directory as file")
++	}
++	if got, err := os.ReadFile(outside); err != nil || string(got) != "preserved" {
++		t.Fatal("outside target changed")
++	}
++}

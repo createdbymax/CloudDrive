@@ -1,0 +1,577 @@
+// !$*UTF8*$!
+{
+"archiveVersion" = 1;
+"classes" = {
+};
+"objectVersion" = 56;
+"objects" = {
+"4DDCE3C8959C449C21460DF2" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "Activity.swift";
+"sourceTree" = "<group>";
+};
+"D405FE13425D01673F7D4BDE" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "4DDCE3C8959C449C21460DF2";
+};
+"AD8A0EE4D05214966BA2A739" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "App.swift";
+"sourceTree" = "<group>";
+};
+"9EF5EE8440339CF1CAA1AB79" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "AD8A0EE4D05214966BA2A739";
+};
+"9103CA5F88ADF20D18D126F9" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "BoundedWork.swift";
+"sourceTree" = "<group>";
+};
+"88498C8C619E23638BB4A602" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "9103CA5F88ADF20D18D126F9";
+};
+"33BAE39793D3E88145350ED8" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "CloudCachePolicy.swift";
+"sourceTree" = "<group>";
+};
+"83524AC8E39DFC20F24029BD" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "33BAE39793D3E88145350ED8";
+};
+"2AE2F89B19FAA838219DD05A" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "Connection.swift";
+"sourceTree" = "<group>";
+};
+"BBF4B059FEA0E86A447A8322" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "2AE2F89B19FAA838219DD05A";
+};
+"284FFA944F77B5955CDD033E" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "ConnectionViews.swift";
+"sourceTree" = "<group>";
+};
+"E43CFEC95F503A9B470FCCF8" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "284FFA944F77B5955CDD033E";
+};
+"18B137F881AA9A06F763F0CC" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "CredentialMigrationStore.swift";
+"sourceTree" = "<group>";
+};
+"F6935199565711ADC215D0DF" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "18B137F881AA9A06F763F0CC";
+};
+"68A3D669792D367F8EC412AC" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "CredentialSession.swift";
+"sourceTree" = "<group>";
+};
+"68E2C7A5A17051E8A1E1E5B1" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "68A3D669792D367F8EC412AC";
+};
+"CAFBCACE9091A3497AFCF442" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "DashboardView.swift";
+"sourceTree" = "<group>";
+};
+"29175F10C5CCE938E2959D64" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "CAFBCACE9091A3497AFCF442";
+};
+"650192BDA0E75E9E2C9D5874" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "Drive.swift";
+"sourceTree" = "<group>";
+};
+"D65F984223356733D99A8E91" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "650192BDA0E75E9E2C9D5874";
+};
+"94A792C8D68E2F937928FB7E" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "DriveMenu.swift";
+"sourceTree" = "<group>";
+};
+"11C6EDE0038900239FABA01F" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "94A792C8D68E2F937928FB7E";
+};
+"A2BFE13CDF3B173CDF5FBB91" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "DriveSettingsView.swift";
+"sourceTree" = "<group>";
+};
+"0491FC68CB3CCB14D3A265D9" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "A2BFE13CDF3B173CDF5FBB91";
+};
+"D33CEFEF5E8D06F6464043AB" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "DriveState.swift";
+"sourceTree" = "<group>";
+};
+"273979B452818C62FDCB25DD" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "D33CEFEF5E8D06F6464043AB";
+};
+"C1C89A810EED7D8217BC7536" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "LocalStorage.swift";
+"sourceTree" = "<group>";
+};
+"567EA7094E5A237E788C38CE" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "C1C89A810EED7D8217BC7536";
+};
+"B2C8507AE5C191B5F1C66AD7" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "LoginItemSettingsView.swift";
+"sourceTree" = "<group>";
+};
+"C404FC10B53F5A74B38DFA86" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "B2C8507AE5C191B5F1C66AD7";
+};
+"947B8360BE429DACC70CA7F2" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "NFSProvenance.swift";
+"sourceTree" = "<group>";
+};
+"063C71A389CD519CD8E2D804" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "947B8360BE429DACC70CA7F2";
+};
+"9FB6948B116A07A938F1815D" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "Runtime.swift";
+"sourceTree" = "<group>";
+};
+"7F26E88D01BD082F2BFBA976" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "9FB6948B116A07A938F1815D";
+};
+"5E1F5616266610B0E7A2ECFC" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "StatusPresentation.swift";
+"sourceTree" = "<group>";
+};
+"8C70447DA05BB945D3AC0681" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "5E1F5616266610B0E7A2ECFC";
+};
+"1F0D0F00EEB3D102860709CF" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "TransferControls.swift";
+"sourceTree" = "<group>";
+};
+"B81C70EC0A3C9A887B5323C6" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "1F0D0F00EEB3D102860709CF";
+};
+"49219518352FA6D4A582ECD6" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "TransfersView.swift";
+"sourceTree" = "<group>";
+};
+"F7F1F0CD4DFF2975F6C1549B" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "49219518352FA6D4A582ECD6";
+};
+"B41C03B34A863FEDE8C0A538" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "UpdateController.swift";
+"sourceTree" = "<group>";
+};
+"57DEC25210E0C6E5B58E8C84" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "B41C03B34A863FEDE8C0A538";
+};
+"A07D2EC90B63B709494E104F" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "UploadProgress.swift";
+"sourceTree" = "<group>";
+};
+"EA8F309C1AA2F7CDDE801AFF" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "A07D2EC90B63B709494E104F";
+};
+"06F2490B026B8C9D223B1BE7" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "UploadProgressView.swift";
+"sourceTree" = "<group>";
+};
+"846C7299BB789FA780CF6B8D" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "06F2490B026B8C9D223B1BE7";
+};
+"ABB730431D6BE7E58A7F2A47" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "WorkerIdentity.swift";
+"sourceTree" = "<group>";
+};
+"3513AF5BA6BB4BCFAB0267AF" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "ABB730431D6BE7E58A7F2A47";
+};
+"6BAB02B549A96CC50D0CA977" = {
+"isa" = "PBXGroup";
+"children" = ("4DDCE3C8959C449C21460DF2", "AD8A0EE4D05214966BA2A739", "9103CA5F88ADF20D18D126F9", "33BAE39793D3E88145350ED8", "2AE2F89B19FAA838219DD05A", "284FFA944F77B5955CDD033E", "18B137F881AA9A06F763F0CC", "68A3D669792D367F8EC412AC", "CAFBCACE9091A3497AFCF442", "650192BDA0E75E9E2C9D5874", "94A792C8D68E2F937928FB7E", "A2BFE13CDF3B173CDF5FBB91", "D33CEFEF5E8D06F6464043AB", "C1C89A810EED7D8217BC7536", "B2C8507AE5C191B5F1C66AD7", "947B8360BE429DACC70CA7F2", "9FB6948B116A07A938F1815D", "5E1F5616266610B0E7A2ECFC", "1F0D0F00EEB3D102860709CF", "49219518352FA6D4A582ECD6", "B41C03B34A863FEDE8C0A538", "A07D2EC90B63B709494E104F", "06F2490B026B8C9D223B1BE7", "ABB730431D6BE7E58A7F2A47");
+"path" = "Sources/CloudDrive";
+"sourceTree" = "<group>";
+};
+"147E460814CB1028A975DA94" = {
+"isa" = "PBXSourcesBuildPhase";
+"buildActionMask" = 2147483647;
+"files" = ("D405FE13425D01673F7D4BDE", "9EF5EE8440339CF1CAA1AB79", "88498C8C619E23638BB4A602", "83524AC8E39DFC20F24029BD", "BBF4B059FEA0E86A447A8322", "E43CFEC95F503A9B470FCCF8", "F6935199565711ADC215D0DF", "68E2C7A5A17051E8A1E1E5B1", "29175F10C5CCE938E2959D64", "D65F984223356733D99A8E91", "11C6EDE0038900239FABA01F", "0491FC68CB3CCB14D3A265D9", "273979B452818C62FDCB25DD", "567EA7094E5A237E788C38CE", "C404FC10B53F5A74B38DFA86", "063C71A389CD519CD8E2D804", "7F26E88D01BD082F2BFBA976", "8C70447DA05BB945D3AC0681", "B81C70EC0A3C9A887B5323C6", "F7F1F0CD4DFF2975F6C1549B", "57DEC25210E0C6E5B58E8C84", "EA8F309C1AA2F7CDDE801AFF", "846C7299BB789FA780CF6B8D", "3513AF5BA6BB4BCFAB0267AF");
+"runOnlyForDeploymentPostprocessing" = 0;
+};
+"AE0042EC290704DA7E641B97" = {
+"isa" = "PBXFileReference";
+"explicitFileType" = "wrapper.application";
+"path" = "CloudDrive.app";
+"sourceTree" = "BUILT_PRODUCTS_DIR";
+};
+"1FE470E4540617B2B034B4A7" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "sourcecode.swift";
+"path" = "main.swift";
+"sourceTree" = "<group>";
+};
+"392E9B1871AE572C7CDFEDAF" = {
+"isa" = "PBXBuildFile";
+"fileRef" = "1FE470E4540617B2B034B4A7";
+};
+"5E78D45701CECD47F9EC5050" = {
+"isa" = "PBXGroup";
+"children" = ("1FE470E4540617B2B034B4A7");
+"path" = "Sources/CloudDriveHelper";
+"sourceTree" = "<group>";
+};
+"A9E0E8C7CA6D3079CEF7E9BD" = {
+"isa" = "PBXSourcesBuildPhase";
+"buildActionMask" = 2147483647;
+"files" = ("392E9B1871AE572C7CDFEDAF");
+"runOnlyForDeploymentPostprocessing" = 0;
+};
+"72CE699445DFC4C87282C3AE" = {
+"isa" = "PBXFileReference";
+"explicitFileType" = "compiled.mach-o.executable";
+"path" = "CloudDriveHelper";
+"sourceTree" = "BUILT_PRODUCTS_DIR";
+};
+"60475AE9D3121291D36B8EDE" = {
+"isa" = "PBXShellScriptBuildPhase";
+"buildActionMask" = 2147483647;
+"files" = ();
+"inputPaths" = ();
+"outputPaths" = ();
+"runOnlyForDeploymentPostprocessing" = 0;
+"alwaysOutOfDate" = 1;
+"name" = "Check signing and inactive app";
+"shellPath" = "/bin/sh";
+"shellScript" = "set -eu\ncd \"$SRCROOT\"\npython3 scripts/package-app.py --preflight \"$TARGET_BUILD_DIR/$WRAPPER_NAME\"\nbackend=\"${CLOUDDRIVE_BACKEND:-$SRCROOT/build/backend/rclone}\"\nif [ ! -x \"$backend\" ]; then\n  echo \"error: Build the backend once: python3 scripts/build-rclone-allocation.py\"\n  exit 1\nfi\n";
+};
+"69EAB37A6BD2038D3010888A" = {
+"isa" = "PBXShellScriptBuildPhase";
+"buildActionMask" = 2147483647;
+"files" = ();
+"inputPaths" = ("$(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)", "$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)");
+"outputPaths" = ();
+"runOnlyForDeploymentPostprocessing" = 0;
+"alwaysOutOfDate" = 1;
+"name" = "Package backend, helper and stable signature";
+"shellPath" = "/bin/sh";
+"shellScript" = "set -eu\ncd \"$SRCROOT\"\npython3 scripts/package-app.py \"$TARGET_BUILD_DIR/$WRAPPER_NAME\" \"$BUILT_PRODUCTS_DIR\" \"${CLOUDDRIVE_BACKEND:-$SRCROOT/build/backend/rclone}\"\n";
+};
+"803932F7A97FAA234D9EF5B9" = {
+"isa" = "PBXContainerItemProxy";
+"containerPortal" = "244210E48437B6556980A702";
+"proxyType" = 1;
+"remoteGlobalIDString" = "BF5585DB99B3652823128692";
+"remoteInfo" = "CloudDriveHelper";
+};
+"5AF79E40EE09C928EAA1BF0B" = {
+"isa" = "PBXTargetDependency";
+"target" = "BF5585DB99B3652823128692";
+"targetProxy" = "803932F7A97FAA234D9EF5B9";
+};
+"D94C31394813EBCC311C44EE" = {
+"isa" = "XCRemoteSwiftPackageReference";
+"repositoryURL" = "https://github.com/sparkle-project/Sparkle";
+"requirement" = {
+"kind" = "exactVersion";
+"version" = "2.10.1";
+};
+};
+"B98791B3B7007E46266561EF" = {
+"isa" = "XCSwiftPackageProductDependency";
+"package" = "D94C31394813EBCC311C44EE";
+"productName" = "Sparkle";
+};
+"6DEB2D210F91407B6480B6F5" = {
+"isa" = "PBXBuildFile";
+"productRef" = "B98791B3B7007E46266561EF";
+};
+"7A4C2DC8FCA657188648E999" = {
+"isa" = "PBXFrameworksBuildPhase";
+"buildActionMask" = 2147483647;
+"files" = ("6DEB2D210F91407B6480B6F5");
+"runOnlyForDeploymentPostprocessing" = 0;
+};
+"B00CCDD09424E369308D67FA" = {
+"isa" = "XCBuildConfiguration";
+"buildSettings" = {
+"ALWAYS_SEARCH_USER_PATHS" = "NO";
+"ARCHS" = "arm64";
+"ONLY_ACTIVE_ARCH" = "YES";
+"ENABLE_DEBUG_DYLIB" = "NO";
+"SWIFT_VERSION" = "5.0";
+"MACOSX_DEPLOYMENT_TARGET" = "14.0";
+"SDKROOT" = "macosx";
+"CODE_SIGNING_ALLOWED" = "NO";
+"ENABLE_USER_SCRIPT_SANDBOXING" = "NO";
+"CLOUDDRIVE_ADHOC_ONLY" = "0";
+"CLOUDDRIVE_SIGN_IDENTITY" = "";
+"CLOUDDRIVE_BACKEND" = "$(SRCROOT)/build/backend/rclone";
+"CLOUDDRIVE_SPARKLE_FEED_URL" = "";
+"CLOUDDRIVE_SPARKLE_PUBLIC_KEY" = "";
+"CLOUDDRIVE_RELEASE" = "0";
+"CLOUDDRIVE_APP_VERSION" = "0.5.5";
+"CLOUDDRIVE_APP_BUILD" = "14";
+"PRODUCT_NAME" = "$(TARGET_NAME)";
+"SWIFT_EMIT_LOC_STRINGS" = "NO";
+"PRODUCT_BUNDLE_IDENTIFIER" = "local.bucketdrive.app";
+"GENERATE_INFOPLIST_FILE" = "YES";
+"INFOPLIST_KEY_CFBundleDisplayName" = "CloudDrive";
+"MARKETING_VERSION" = "0.5.5";
+"CURRENT_PROJECT_VERSION" = "14";
+"ENABLE_APP_SANDBOX" = "NO";
+"COMBINE_HIDPI_IMAGES" = "YES";
+"LD_RUNPATH_SEARCH_PATHS" = ("$(inherited)", "@executable_path/../Frameworks");
+"SWIFT_OPTIMIZATION_LEVEL" = "-Onone";
+"DEBUG_INFORMATION_FORMAT" = "dwarf";
+"ENABLE_TESTABILITY" = "YES";
+"SWIFT_ACTIVE_COMPILATION_CONDITIONS" = "DEBUG";
+};
+"name" = "Debug";
+};
+"1B104479E55E37CF8A63CBDF" = {
+"isa" = "XCBuildConfiguration";
+"buildSettings" = {
+"ALWAYS_SEARCH_USER_PATHS" = "NO";
+"ARCHS" = "arm64";
+"ONLY_ACTIVE_ARCH" = "YES";
+"ENABLE_DEBUG_DYLIB" = "NO";
+"SWIFT_VERSION" = "5.0";
+"MACOSX_DEPLOYMENT_TARGET" = "14.0";
+"SDKROOT" = "macosx";
+"CODE_SIGNING_ALLOWED" = "NO";
+"ENABLE_USER_SCRIPT_SANDBOXING" = "NO";
+"CLOUDDRIVE_ADHOC_ONLY" = "0";
+"CLOUDDRIVE_SIGN_IDENTITY" = "";
+"CLOUDDRIVE_BACKEND" = "$(SRCROOT)/build/backend/rclone";
+"CLOUDDRIVE_SPARKLE_FEED_URL" = "";
+"CLOUDDRIVE_SPARKLE_PUBLIC_KEY" = "";
+"CLOUDDRIVE_RELEASE" = "0";
+"CLOUDDRIVE_APP_VERSION" = "0.5.5";
+"CLOUDDRIVE_APP_BUILD" = "14";
+"PRODUCT_NAME" = "$(TARGET_NAME)";
+"SWIFT_EMIT_LOC_STRINGS" = "NO";
+"PRODUCT_BUNDLE_IDENTIFIER" = "local.bucketdrive.app";
+"GENERATE_INFOPLIST_FILE" = "YES";
+"INFOPLIST_KEY_CFBundleDisplayName" = "CloudDrive";
+"MARKETING_VERSION" = "0.5.5";
+"CURRENT_PROJECT_VERSION" = "14";
+"ENABLE_APP_SANDBOX" = "NO";
+"COMBINE_HIDPI_IMAGES" = "YES";
+"LD_RUNPATH_SEARCH_PATHS" = ("$(inherited)", "@executable_path/../Frameworks");
+"SWIFT_OPTIMIZATION_LEVEL" = "-O";
+"DEBUG_INFORMATION_FORMAT" = "dwarf-with-dsym";
+};
+"name" = "Release";
+};
+"06CB67C35A91E16DBD17B949" = {
+"isa" = "XCConfigurationList";
+"buildConfigurations" = ("B00CCDD09424E369308D67FA", "1B104479E55E37CF8A63CBDF");
+"defaultConfigurationIsVisible" = 0;
+"defaultConfigurationName" = "Release";
+};
+"C1E9827DB735CA9BAA54A540" = {
+"isa" = "PBXNativeTarget";
+"buildConfigurationList" = "06CB67C35A91E16DBD17B949";
+"buildPhases" = ("60475AE9D3121291D36B8EDE", "147E460814CB1028A975DA94", "7A4C2DC8FCA657188648E999", "69EAB37A6BD2038D3010888A");
+"packageProductDependencies" = ("B98791B3B7007E46266561EF");
+"buildRules" = ();
+"dependencies" = ("5AF79E40EE09C928EAA1BF0B");
+"name" = "CloudDrive";
+"productName" = "CloudDrive";
+"productReference" = "AE0042EC290704DA7E641B97";
+"productType" = "com.apple.product-type.application";
+};
+"BDFD4597519099F6A0970D19" = {
+"isa" = "XCBuildConfiguration";
+"buildSettings" = {
+"ALWAYS_SEARCH_USER_PATHS" = "NO";
+"ARCHS" = "arm64";
+"ONLY_ACTIVE_ARCH" = "YES";
+"ENABLE_DEBUG_DYLIB" = "NO";
+"SWIFT_VERSION" = "5.0";
+"MACOSX_DEPLOYMENT_TARGET" = "14.0";
+"SDKROOT" = "macosx";
+"CODE_SIGNING_ALLOWED" = "NO";
+"ENABLE_USER_SCRIPT_SANDBOXING" = "NO";
+"CLOUDDRIVE_ADHOC_ONLY" = "0";
+"CLOUDDRIVE_SIGN_IDENTITY" = "";
+"CLOUDDRIVE_BACKEND" = "$(SRCROOT)/build/backend/rclone";
+"CLOUDDRIVE_SPARKLE_FEED_URL" = "";
+"CLOUDDRIVE_SPARKLE_PUBLIC_KEY" = "";
+"CLOUDDRIVE_RELEASE" = "0";
+"CLOUDDRIVE_APP_VERSION" = "0.5.5";
+"CLOUDDRIVE_APP_BUILD" = "14";
+"PRODUCT_NAME" = "$(TARGET_NAME)";
+"SWIFT_EMIT_LOC_STRINGS" = "NO";
+"SWIFT_OPTIMIZATION_LEVEL" = "-Onone";
+"DEBUG_INFORMATION_FORMAT" = "dwarf";
+"ENABLE_TESTABILITY" = "YES";
+"SWIFT_ACTIVE_COMPILATION_CONDITIONS" = "DEBUG";
+};
+"name" = "Debug";
+};
+"10EFED72F8D773E3546A610A" = {
+"isa" = "XCBuildConfiguration";
+"buildSettings" = {
+"ALWAYS_SEARCH_USER_PATHS" = "NO";
+"ARCHS" = "arm64";
+"ONLY_ACTIVE_ARCH" = "YES";
+"ENABLE_DEBUG_DYLIB" = "NO";
+"SWIFT_VERSION" = "5.0";
+"MACOSX_DEPLOYMENT_TARGET" = "14.0";
+"SDKROOT" = "macosx";
+"CODE_SIGNING_ALLOWED" = "NO";
+"ENABLE_USER_SCRIPT_SANDBOXING" = "NO";
+"CLOUDDRIVE_ADHOC_ONLY" = "0";
+"CLOUDDRIVE_SIGN_IDENTITY" = "";
+"CLOUDDRIVE_BACKEND" = "$(SRCROOT)/build/backend/rclone";
+"CLOUDDRIVE_SPARKLE_FEED_URL" = "";
+"CLOUDDRIVE_SPARKLE_PUBLIC_KEY" = "";
+"CLOUDDRIVE_RELEASE" = "0";
+"CLOUDDRIVE_APP_VERSION" = "0.5.5";
+"CLOUDDRIVE_APP_BUILD" = "14";
+"PRODUCT_NAME" = "$(TARGET_NAME)";
+"SWIFT_EMIT_LOC_STRINGS" = "NO";
+"SWIFT_OPTIMIZATION_LEVEL" = "-O";
+"DEBUG_INFORMATION_FORMAT" = "dwarf-with-dsym";
+};
+"name" = "Release";
+};
+"0AC8AC0FF88EF1971E1586B5" = {
+"isa" = "XCConfigurationList";
+"buildConfigurations" = ("BDFD4597519099F6A0970D19", "10EFED72F8D773E3546A610A");
+"defaultConfigurationIsVisible" = 0;
+"defaultConfigurationName" = "Release";
+};
+"BF5585DB99B3652823128692" = {
+"isa" = "PBXNativeTarget";
+"buildConfigurationList" = "0AC8AC0FF88EF1971E1586B5";
+"buildPhases" = ("A9E0E8C7CA6D3079CEF7E9BD");
+"buildRules" = ();
+"dependencies" = ();
+"name" = "CloudDriveHelper";
+"productName" = "CloudDriveHelper";
+"productReference" = "72CE699445DFC4C87282C3AE";
+"productType" = "com.apple.product-type.tool";
+};
+"0A3E27B8CA818264D75C8D81" = {
+"isa" = "PBXGroup";
+"children" = ("AE0042EC290704DA7E641B97", "72CE699445DFC4C87282C3AE");
+"name" = "Products";
+"sourceTree" = "<group>";
+};
+"711A6108BA2CE6CA93DD47D6" = {
+"isa" = "PBXFileReference";
+"lastKnownFileType" = "net.daringfireball.markdown";
+"path" = "README.md";
+"sourceTree" = "<group>";
+};
+"19F479106CE8C3BA8C106518" = {
+"isa" = "PBXGroup";
+"children" = ("6BAB02B549A96CC50D0CA977", "5E78D45701CECD47F9EC5050", "711A6108BA2CE6CA93DD47D6", "0A3E27B8CA818264D75C8D81");
+"sourceTree" = "<group>";
+};
+"73EBF6644258C120893E685D" = {
+"isa" = "XCBuildConfiguration";
+"buildSettings" = {
+"SWIFT_OPTIMIZATION_LEVEL" = "-Onone";
+"DEBUG_INFORMATION_FORMAT" = "dwarf";
+"ENABLE_TESTABILITY" = "YES";
+"SWIFT_ACTIVE_COMPILATION_CONDITIONS" = "DEBUG";
+};
+"name" = "Debug";
+};
+"0B0C687DF8B6B8DC790B519C" = {
+"isa" = "XCBuildConfiguration";
+"buildSettings" = {
+"SWIFT_OPTIMIZATION_LEVEL" = "-O";
+"DEBUG_INFORMATION_FORMAT" = "dwarf-with-dsym";
+};
+"name" = "Release";
+};
+"76F8DEC3DFE0BDB465198890" = {
+"isa" = "XCConfigurationList";
+"buildConfigurations" = ("73EBF6644258C120893E685D", "0B0C687DF8B6B8DC790B519C");
+"defaultConfigurationIsVisible" = 0;
+"defaultConfigurationName" = "Release";
+};
+"244210E48437B6556980A702" = {
+"isa" = "PBXProject";
+"attributes" = {
+"BuildIndependentTargetsInParallel" = "YES";
+"LastUpgradeCheck" = "2700";
+};
+"buildConfigurationList" = "76F8DEC3DFE0BDB465198890";
+"compatibilityVersion" = "Xcode 14.0";
+"developmentRegion" = "en";
+"hasScannedForEncodings" = 0;
+"knownRegions" = ("en", "Base");
+"packageReferences" = ("D94C31394813EBCC311C44EE");
+"mainGroup" = "19F479106CE8C3BA8C106518";
+"productRefGroup" = "0A3E27B8CA818264D75C8D81";
+"projectDirPath" = "";
+"projectRoot" = "";
+"targets" = ("C1E9827DB735CA9BAA54A540", "BF5585DB99B3652823128692");
+};
+};
+"rootObject" = "244210E48437B6556980A702";
+}

@@ -1,0 +1,58 @@
+--- a/file.go
++++ b/file.go
+@@ -1,3 +1,4 @@
++// Modified for CloudDrive (2026-11-03): optional local-allocation attributes.
+ package nfs
+ 
+ import (
+@@ -123,6 +124,11 @@
+ 
+ 	f.Filesize = uint64(info.Size())
+ 	f.Used = uint64(info.Size())
++	// A virtual filesystem can expose local physical allocation independently
++	// from logical remote size. Unrelated files retain the existing fallback.
++	if allocated, ok := info.(interface{ AllocatedBytes() uint64 }); ok {
++		f.Used = allocated.AllocatedBytes()
++	}
+ 	f.Atime = ToNFSTime(info.ModTime())
+ 	f.Mtime = f.Atime
+ 	f.Ctime = f.Atime
+--- /dev/null
++++ b/used_allocation_test.go
+@@ -0,0 +1,36 @@
++// CloudDrive addition (2026-11-03): local-allocation attribute tests.
++package nfs
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++type explicitAllocationInfo struct {
++	os.FileInfo
++	used uint64
++}
++
++func (i explicitAllocationInfo) AllocatedBytes() uint64 { return i.used }
++
++func TestOptionalAllocatedBytesPreservesLogicalFileSize(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "allocation")
++	if err := os.WriteFile(path, make([]byte, 8192), 0600); err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, used := range []uint64{0, 4096, 8192} {
++		attrs := ToFileAttribute(explicitAllocationInfo{info, used}, path)
++		if attrs.Filesize != 8192 || attrs.Used != used {
++			t.Fatalf("size/used=%d/%d, want8192/%d", attrs.Filesize, attrs.Used, used)
++		}
++	}
++	fallback := ToFileAttribute(info, path)
++	if fallback.Filesize != 8192 || fallback.Used != 8192 {
++		t.Fatal("unrelated allocation fallback changed")
++	}
++}

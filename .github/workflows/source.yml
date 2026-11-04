@@ -1,0 +1,24 @@
+name: Source verification
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-15-arm64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check architecture and Swift
+        run: |
+          test "$(uname -m)" = arm64
+          swift --version
+      - name: Rebuild pinned backend
+        run: python3 scripts/build-rclone-allocation.py
+      - name: Build and test Swift
+        run: |
+          swift build
+          swift test
+      - name: Test packaging configuration
+        run: python3 -m unittest discover -s Tests/Signing
+      - name: Package UI preview without credentials
+        run: CLOUDDRIVE_ADHOC_ONLY=1 CLOUDDRIVE_DISABLE_UPDATES=1 ./scripts/build-app.sh

@@ -1,0 +1,30 @@
+{
+  "version": "v1.75.2-clouddrive.1",
+  "goVersion": "go1.27.3",
+  "platform": "darwin/arm64",
+  "cgoEnabled": false,
+  "sources": [
+    {
+      "name": "rclone",
+      "url": "https://github.com/rclone/rclone/archive/refs/tags/v1.75.2.tar.gz",
+      "sha256": "68afd7f68c84bd978966feae2116339aa7bf454b39c573910c462e87c3774d5a"
+    },
+    {
+      "name": "go-nfs",
+      "url": "https://github.com/willscott/go-nfs/archive/refs/tags/v0.0.4.tar.gz",
+      "sha256": "d7b0286913088352040fce47d3d69507fca59208ef84256d6e1bd5ffda8b92b8"
+    },
+    {
+      "name": "go",
+      "url": "https://go.dev/dl/go1.27.3.darwin-arm64.tar.gz",
+      "sha256": "dd3908cf20959d798c1e06ebe5b72213f0505ce01373b40ce3110975a6cd99c2"
+    }
+  ],
+  "patches": {
+    "0001-go-nfs-local-allocation.patch": "10bfbbe21568a2bde88688ad1d48df8f8e5f59f03327cdfa7565c3987954146a",
+    "0002-rclone-local-allocation.patch": "0d6d7e8b6cf31eeb6c128716bf1a3244a6295e85c5f1429d8ace96fa615d6e92"
+  },
+  "referencePatchedBinarySHA256": "69ad2e4f2c07bc0b64d436d2bbe586653f55d61e7837ca765eaf3d1ade647052",
+  "referenceUpstreamBinarySHA256": "af0257730173748dc9706ad3c83288bf3a0c5d5e9768fef20235e375e9d835e1",
+  "binaryHashNote": "Historical darwin/arm64 artifact references; no executable is distributed in this source export. Source/patch hashes are the build inputs. A rebuilt artifact must be qualified independently."
+}

@@ -1,0 +1,22 @@
+.build/
+build/
+experiments/streaming-nfs/bin/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key
+*.pem
+*.cer
+*.mobileprovision
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+
+# Local source-release preparation records
+/docs/BEFORE_PUBLISHING.md
+/docs/VERIFICATION.md
