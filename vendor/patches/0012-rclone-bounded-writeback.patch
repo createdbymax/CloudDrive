@@ -1,0 +1,2247 @@
+--- /dev/null
++++ b/backend/s3/clouddrive_spill_base.go
+@@ -0,0 +1,24 @@
++// Modified for CloudDrive: stream a single conditional view of an existing R2 object.
++package s3
++
++import (
++	"context"
++	"errors"
++	"github.com/rclone/rclone/fs"
++	"io"
++)
++
++func (f *Fs) OpenSpillBase(ctx context.Context, source fs.Object) (io.ReadCloser, error) {
++	src, ok := source.(*Object)
++	if !ok || src.fs != f || f.opt.DownloadURL != "" {
++		return nil, errors.New("unsupported spill source")
++	}
++	head, err := src.headObject(ctx)
++	if err != nil {
++		return nil, err
++	}
++	if head.ETag == nil || *head.ETag == "" || head.ContentLength == nil || *head.ContentLength != src.Size() {
++		return nil, errors.New("spill source changed")
++	}
++	return src.Open(ctx, &fs.HTTPOption{Key: "If-Match", Value: *head.ETag})
++}
+--- a/cmd/serve/nfs/server.go
++++ b/cmd/serve/nfs/server.go
+@@ -25,6 +25,12 @@
+ 
+ // NewServer creates a new server
+ func NewServer(ctx context.Context, vfs *vfs.VFS, opt *Options) (s *Server, err error) {
++	if e := vfs.SpillInitError(); e != nil {
++		return nil, e
++	}
++	if vfs.Opt.SpillPrefix != "" && vfs.Opt.CacheMode != vfscommon.CacheModeFull {
++		return nil, fmt.Errorf("bounded writeback requires successfully initialized full cache")
++	}
+ 	if vfs.Opt.CacheMode == vfscommon.CacheModeOff {
+ 		fs.LogPrintf(fs.LogLevelWarning, ctx, "NFS writes don't work without a cache, the filesystem will be served read-only")
+ 	}
+--- a/vfs/concurrent_moves.go
++++ b/vfs/concurrent_moves.go
+@@ -156,6 +156,14 @@
+ 		free = matched
+ 	}
+ 	if free == nil {
++		return "", syscall.EBUSY
++	}
++	// NFS may have closed its short-lived RPC write handle while the VFS still
++	// owns a dirty file. Reject new protected moves before saving a preparation
++	// record. This check runs again under admission after remote preflight.
++	if exclusive && v.cache != nil && v.cache.HasBusyMoveItem(func(name string) bool {
++		return v.scopesIntersect(name, name, false, source, dest, true)
++	}) {
+ 		return "", syscall.EBUSY
+ 	}
+ 	if exclusive && !checked {
+--- a/vfs/vfs.go
++++ b/vfs/vfs.go
+@@ -23,6 +23,7 @@
+ import (
+ 	"context"
+ 	_ "embed"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"os"
+@@ -179,6 +180,7 @@
+ 
+ // VFS represents the top level filing system
+ type VFS struct {
++	spillInitErr    error
+ 	safeMoves       safeMoveState
+ 	moveSlots       [3]safeMoveState
+ 	moveAdmission   sync.Mutex
+@@ -377,13 +379,19 @@
+ }
+ 
+ // SetCacheMode change the cache mode
++func (vfs *VFS) SpillInitError() error { return vfs.spillInitErr }
++
+ func (vfs *VFS) SetCacheMode(cacheMode vfscommon.CacheMode) {
++	vfs.spillInitErr = nil
+ 	vfs.shutdownCache()
+ 	vfs.cache = nil
+ 	if cacheMode > vfscommon.CacheModeOff {
+ 		ctx, cancel := context.WithCancel(vfs.ctx)
+ 		cache, err := vfscache.New(ctx, vfs.f, &vfs.Opt, vfs.AddVirtual)
+ 		if err != nil {
++			if errors.Is(err, vfscache.ErrSpillCache) || vfs.Opt.SpillPrefix != "" {
++				vfs.spillInitErr = err
++			}
+ 			fs.Errorf(nil, "Failed to create vfs cache - disabling: %v", err)
+ 			vfs.Opt.CacheMode = vfscommon.CacheModeOff
+ 			cancel()
+--- a/vfs/vfscache/cache.go
++++ b/vfs/vfscache/cache.go
+@@ -40,6 +40,13 @@
+ 
+ // Cache opened files
+ type Cache struct {
++	spillReads    spillReadCache
++	spillReserved int64
++	spillAux      string
++	spill         spillProvider
++	spillMu       sync.Mutex
++	spillTotal    int64
++	spillResident map[*Item]int64
+ 	// read only - no locking needed to read these
+ 	ctx        context.Context      // context for cache lifetime
+ 	fremote    fs.Fs                // fs for the remote we are caching
+@@ -132,6 +139,31 @@
+ 		avFn:       avFn,
+ 	}
+ 
++	if err = c.checkSpillBinding(); err != nil {
++		return nil, fmt.Errorf("%w: %w", ErrSpillCache, err)
++	}
++	if err = c.initSpill(ctx); err != nil {
++		return nil, err
++	}
++
++	if c.spill != nil {
++		if err = c.recordSpillBinding(); err != nil {
++			return nil, err
++		}
++		if err = c.validateSpillRecovery(); err != nil {
++			return nil, err
++		}
++		pending, e := filepath.Glob(filepath.Join(c.spillAux, "*.adopting"))
++		if e != nil {
++			return nil, e
++		}
++		for _, p := range pending {
++			if e = c.retireAdoption(p); e != nil {
++				return nil, e
++			}
++		}
++		go c.retrySpillCleanup(ctx)
++	}
+ 	// load in the cache and metadata off disk
+ 	err = c.reload(ctx)
+ 	if err != nil {
+@@ -925,3 +957,21 @@
+ 	}
+ 	return false
+ }
++
++// HasBusyMoveItem checks the same normalized paths used for write admission.
++func (c *Cache) HasBusyMoveItem(matches func(string) bool) bool {
++	c.mu.Lock()
++	var candidates []*Item
++	for name, item := range c.item {
++		if matches(name) {
++			candidates = append(candidates, item)
++		}
++	}
++	c.mu.Unlock()
++	for _, item := range candidates {
++		if item.inUse() {
++			return true
++		}
++	}
++	return false
++}
+--- a/vfs/vfscache/item.go
++++ b/vfs/vfscache/item.go
+@@ -8,6 +8,7 @@
+ 	"io"
+ 	"os"
+ 	"sync"
++	"syscall"
+ 	"time"
+ 
+ 	"github.com/rclone/rclone/fs"
+@@ -55,6 +56,9 @@
+ //
+ // The Info field is written to the backing store to store status
+ type Item struct {
++	spillWorkers     int
++	spillPublishing  chan struct{}
++	spillFault       error
+ 	// read only
+ 	c               *Cache                   // cache this is part of
+ 	mu              sync.Mutex               // protect the variables
+@@ -75,6 +79,7 @@
+ 
+ // Info is persisted to backing store
+ type Info struct {
++	Spill       *spillState   `json:",omitempty"`
+ 	ModTime     time.Time     // last time file was modified
+ 	ATime       time.Time     // last time file was accessed
+ 	Size        int64         // size of the file
+@@ -146,6 +151,14 @@
+ 	// check the cache file exists
+ 	osPath := c.toOSPath(name)
+ 	fi, statErr := os.Stat(osPath)
++	if statErr != nil && c.spill != nil {
++		// A missing dirty data file must never erase its ownership record.
++		exists, e := item.load()
++		if exists && (e != nil || item.info.Spill != nil) {
++			item.spillFault = fmt.Errorf("preserving unreadable spill backing: %w", statErr)
++			return item
++		}
++	}
+ 	if statErr != nil {
+ 		if os.IsNotExist(statErr) {
+ 			item._removeMeta("cache file doesn't exist")
+@@ -159,6 +172,10 @@
+ 	if !exists {
+ 		item._removeFile("metadata doesn't exist")
+ 	} else if err != nil {
++		if c.spill != nil {
++			item.spillFault = err
++			return item
++		}
+ 		item.remove(fmt.Sprintf("failed to load metadata: %v", err))
+ 	}
+ 
+@@ -173,7 +190,7 @@
+ func (item *Item) inUse() bool {
+ 	item.mu.Lock()
+ 	defer item.mu.Unlock()
+-	return item.opens != 0 || item.info.Dirty
++	return item.opens != 0 || item.info.Dirty || item.spillWorkers > 0
+ }
+ 
+ // getDiskSize returns the size on disk (approximately) of the item
+@@ -204,13 +221,20 @@
+ 	if err != nil {
+ 		return true, fmt.Errorf("vfs cache item: corrupt metadata: %w", err)
+ 	}
+-	return true, nil
++	return true, item.validSpill()
+ }
+ 
+ // save writes an item to the disk
+ //
+ // call with the lock held
+ func (item *Item) _save() (err error) {
++	if item.spillFault != nil {
++		return item.spillFault
++	}
++	if item.info.Spill != nil {
++		return item.saveSpillInfo()
++	}
++
+ 	osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
+ 	out, err := os.Create(osPathMeta)
+ 	if err != nil {
+@@ -330,6 +354,22 @@
+ 	item.mu.Lock()
+ 	defer item.mu.Unlock()
+ 
++	item.waitSpill()
++	if item.spillFault != nil {
++		return item.spillFault
++	}
++	if item.c.spill != nil && item.info.Spill == nil && item.fd != nil && size > item.info.Size {
++		target, release := item.reserveSpill(0)
++		release()
++		if item.canBeginSpill(size-1, 1, target) {
++			if err := item.beginSpill(); err != nil {
++				return err
++			}
++		}
++	}
++	if item.info.Spill != nil {
++		return item.truncateSpill(size)
++	}
+ 	if item.fd == nil {
+ 		return errors.New("vfs cache item truncate: internal error: didn't Open file")
+ 	}
+@@ -534,6 +574,10 @@
+ 		item.mu.Lock()
+ 	}
+ 
++	item.waitSpill()
++	if item.spillFault != nil {
++		return item.spillFault
++	}
+ 	item.info.ATime = time.Now()
+ 
+ 	osPath, err := item.c.createItemDir(item.name) // No locking in Cache
+@@ -640,6 +684,9 @@
+ //
+ // Call with lock held
+ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
++	if item.info.Spill != nil {
++		return item.publishSpill(ctx, storeFn)
++	}
+ 	// defer log.Trace(item.name, "item=%p", item)("err=%v", &err)
+ 
+ 	// Transfer the temp file to the remote
+@@ -679,6 +726,7 @@
+ 
+ 	// Show item is clean and is eligible for cache removal
+ 	item.info.Dirty = false
++	item.accountSpill(0)
+ 	err = item._save()
+ 	if err != nil {
+ 		fs.Errorf(item.name, "vfs cache: failed to write metadata file: %v", err)
+@@ -773,7 +821,7 @@
+ 	// FIXME It would be nice to do this asynchronously however it
+ 	// would require keeping the downloaders alive after the item
+ 	// has been closed
+-	if item.info.Dirty && item.o != nil {
++	if item.info.Dirty && item.o != nil && item.info.Spill == nil {
+ 		err = item._ensure(0, item.info.Size)
+ 		if err != nil {
+ 			return fmt.Errorf("vfs cache: failed to download missing parts of cache file: %w", err)
+@@ -859,6 +907,11 @@
+ // metaDirty will be false.
+ func (item *Item) reload(ctx context.Context) error {
+ 	item.mu.Lock()
++	if item.spillFault != nil {
++		err := item.spillFault
++		item.mu.Unlock()
++		return err
++	}
+ 	dirty := item.info.Dirty
+ 	item.mu.Unlock()
+ 	if !dirty {
+@@ -990,9 +1043,31 @@
+ 	item.mu.Unlock()
+ 	wasWriting = item.c.writeback.Remove(item.writeBackID)
+ 	item.mu.Lock()
++	item.waitSpill()
++	if item.info.Spill != nil && (reason != "file deleted") {
++		fs.Errorf(item.name, "preserving spill mapping during %s", reason)
++		return wasWriting
++	}
++	var ticket string
++	if item.info.Spill != nil {
++		var err error
++		ticket, err = item.stageCleanup()
++		if err != nil {
++			fs.Errorf(item.name, "could not record removal cleanup: %v", err)
++			return wasWriting
++		}
++	}
++	item.accountSpill(0)
+ 	item.info.clean()
+ 	item._removeFile(reason)
+ 	item._removeMeta(reason)
++	if ticket != "" {
++		unlockMutexForCall(&item.mu, func() {
++			if err := item.c.finishCleanup(item.c.ctx, ticket); err != nil {
++				fs.Errorf(item.name, "retaining writeback cleanup ticket: %v", err)
++			}
++		})
++	}
+ 	return wasWriting
+ }
+ 
+@@ -1015,7 +1090,7 @@
+ 	spaceFreed = 0
+ 	removed = false
+ 
+-	if item.opens != 0 || item.info.Dirty || item.graceTimer != nil {
++	if item.opens != 0 || item.info.Dirty || item.graceTimer != nil || item.spillWorkers > 0 {
+ 		return
+ 	}
+ 
+@@ -1050,6 +1125,9 @@
+ 	item.mu.Lock()
+ 	defer item.mu.Unlock()
+ 
++	if item.spillWorkers > 0 {
++		return SkippedPendingAccess, 0, nil
++	}
+ 	// The item is not being used now.  Just remove it instead of resetting it.
+ 	// Items in their grace period are treated as in-use; the cache
+ 	// cleaner will pick them up on the next pass.
+@@ -1407,6 +1485,13 @@
+ 	}
+ 	defer item.mu.Unlock()
+ 
++	if item.info.Spill != nil {
++		if item.spillFault != nil {
++			return 0, item.spillFault
++		}
++		return item.readSpillAt(item.c.ctx, item.fd, b, off)
++	}
++
+ 	err = item._ensure(off, int64(len(b)))
+ 	if err != nil {
+ 		return 0, err
+@@ -1435,6 +1520,51 @@
+ 	if item.fd == nil {
+ 		item.mu.Unlock()
+ 		return 0, errors.New("vfs cache item WriteAt: internal error: didn't Open file")
++	}
++	if item.c.spill != nil || item.info.Spill != nil {
++		if off < 0 {
++			item.mu.Unlock()
++			return 0, syscall.EINVAL
++		}
++		if len(b) == 0 {
++			item.mu.Unlock()
++			return 0, nil
++		}
++		item.waitSpill()
++		if item.spillFault != nil {
++			item.mu.Unlock()
++			return 0, item.spillFault
++		}
++		wasDirty, oldModified, oldTime := item.info.Dirty, item.modified, item.info.ModTime
++		item._dirty()
++		target, release := item.reserveSpill(int64(len(b)))
++		defer release()
++		if item.info.Spill != nil || item.canBeginSpill(off, int64(len(b)), target) {
++			defer item.mu.Unlock()
++			n, err = item.writeSpill(b, off, target)
++			if err != nil && n == 0 && !wasDirty && item.info.Spill == nil {
++				item.info.Dirty = false
++				item.modified = oldModified
++				item.info.ModTime = oldTime
++				if e := item._save(); e != nil {
++					return 0, e
++				}
++			}
++			return n, err
++		}
++		// Serialize covered-file admission with ordinary writes while the
++		// window is enabled so conversion cannot read an in-flight range.
++		n, err = item.fd.WriteAt(b, off)
++		if n > 0 {
++			if off > item.info.Size {
++				item._written(item.info.Size, off-item.info.Size)
++			}
++			item._written(off, int64(n))
++			item.info.Size = max(item.info.Size, off+int64(n))
++			item.accountDirtySpill()
++		}
++		item.mu.Unlock()
++		return n, err
+ 	}
+ 	item.mu.Unlock()
+ 	// Do the writing with Item.mu unlocked
+@@ -1472,6 +1602,10 @@
+ // bytes which were processed but not actually written to the file.
+ func (item *Item) WriteAtNoOverwrite(b []byte, off int64) (n int, skipped int, err error) {
+ 	item.mu.Lock()
++	if item.info.Spill != nil {
++		item.mu.Unlock()
++		return len(b), len(b), nil
++	}
+ 
+ 	var (
+ 		// Range we wish to write
+@@ -1546,6 +1680,11 @@
+ 	defer item.postAccess()
+ 	item.mu.Lock()
+ 
++	if item.info.Spill != nil {
++		item.mu.Unlock()
++		return syscall.EBUSY
++	}
++
+ 	// stop downloader
+ 	downloaders := item.downloaders
+ 	item.downloaders = nil
+--- /dev/null
++++ b/vfs/vfscache/spill.go
+@@ -0,0 +1,640 @@
++// Modified for CloudDrive: verified sparse-cache writeback for complete local generations.
++package vfscache
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"hash"
++	"io"
++	"os"
++	"path/filepath"
++	"regexp"
++	"runtime"
++	"syscall"
++
++	"github.com/google/uuid"
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/object"
++	"github.com/rclone/rclone/lib/diskusage"
++	"github.com/rclone/rclone/lib/ranges"
++)
++
++var ErrSpillCache = errors.New("writeback cache cannot be mounted safely")
++
++const spillPage int64 = 4 << 20
++const maxSpillPages = 1 << 20
++
++var spillPrefixRE = regexp.MustCompile(`^[.]clouddrive-spill-[0-9a-f]{64}$`)
++
++type spillProvider interface {
++	InitSpillNamespace(context.Context, string) error
++	StoreSpillChunk(context.Context, string, []byte) error
++	ReadSpillChunk(context.Context, string) ([]byte, error)
++	DeleteSpillChunk(context.Context, string) error
++}
++type spillRef struct {
++	Hash  string
++	Bytes int64
++}
++type spillState struct {
++	AdoptingName       string `json:",omitempty"`
++	Version            int
++	Prefix, Generation string
++	Pages              map[int64]spillRef `json:",omitempty"`
++	// Every attempted immutable key remains attributable to this unique generation.
++	Keys        map[string]bool `json:",omitempty"`
++	IndexBytes  int64
++	IndexDigest [32]byte
++	pending     []indexRecord
++	validated   bool
++}
++
++func (c *Cache) initSpill(ctx context.Context) error {
++	if c.opt.SpillPrefix == "" {
++		return nil
++	}
++	p, ok := c.fremote.(spillProvider)
++	if runtime.GOOS != "darwin" || !ok || !spillPrefixRE.MatchString(c.opt.SpillPrefix) || int64(c.opt.SpillWindow) < spillPage || int64(c.opt.SpillWindow) > 1<<32 {
++		return errors.New("invalid bounded writeback configuration")
++	}
++	if err := p.InitSpillNamespace(ctx, c.opt.SpillPrefix); err != nil {
++		return err
++	}
++	c.spill = p
++	c.spillResident = make(map[*Item]int64)
++	return nil
++}
++
++// Replace the metadata atomically. A range cannot be punched until the new
++// mapping and its directory entry have both reached stable storage.
++func durableJSONIn(tmpDir, path string, v any) error {
++	dir := filepath.Dir(path)
++	f, err := os.CreateTemp(tmpDir, ".cd-save-*")
++	if err != nil {
++		return err
++	}
++	tmp := f.Name()
++	defer os.Remove(tmp)
++	err = json.NewEncoder(f).Encode(v)
++	if err == nil {
++		err = f.Sync()
++	}
++	if closeErr := f.Close(); err == nil {
++		err = closeErr
++	}
++	if err == nil {
++		err = os.Rename(tmp, path)
++	}
++	if err == nil {
++		d, e := os.Open(dir)
++		if e != nil {
++			return e
++		}
++		err = d.Sync()
++		_ = d.Close()
++	}
++	return err
++}
++func (i *Item) saveSpillInfo() error {
++	return i.commitSpillIndex()
++}
++func (i *Item) waitSpill() {
++	for i.spillPublishing != nil {
++		done := i.spillPublishing
++		i.mu.Unlock()
++		<-done
++		i.mu.Lock()
++	}
++}
++func (i *Item) validSpill() error {
++	s := i.info.Spill
++	if s == nil {
++		return nil
++	}
++	u, e := uuid.Parse(s.Generation)
++	if i.c.spill == nil || (s.Version != 1 && s.Version != 2) || s.Prefix != i.c.opt.SpillPrefix || e != nil || u.Version() != 4 || u.String() != s.Generation || len(s.Pages) > maxSpillPages || len(s.Keys) > maxSpillPages {
++		return errors.New("invalid or unavailable dirty spill generation")
++	}
++	if s.validated {
++		return nil
++	}
++	if s.Version == 2 {
++		if err := i.readSpillIndex(); err != nil {
++			return err
++		}
++	}
++	if s.Pages == nil || s.Keys == nil {
++		return errors.New("missing spill index")
++	}
++	for k := range s.Keys {
++		if len(k) != 64 {
++			return errors.New("invalid spill hash")
++		}
++		if _, err := hex.DecodeString(k); err != nil {
++			return err
++		}
++	}
++	for page, r := range s.Pages {
++		if page < 0 || page >= maxSpillPages || r.Bytes <= 0 || r.Bytes > spillPage || !s.Keys[r.Hash] {
++			return errors.New("invalid spill reference")
++		}
++	}
++	s.validated = true
++	return nil
++}
++func (i *Item) accountSpill(size int64) {
++	c := i.c
++	if c.spill == nil {
++		return
++	}
++	c.spillMu.Lock()
++	defer c.spillMu.Unlock()
++	c.spillTotal += size - c.spillResident[i]
++	if size == 0 {
++		delete(c.spillResident, i)
++	} else {
++		c.spillResident[i] = size
++	}
++}
++
++// APFS can reserve blocks outside the logical dirty extents. Charge those
++// blocks until publication or until a later punch actually releases them.
++func (i *Item) accountDirtySpill() {
++	used := i.info.Rs.Size()
++	if physical, err := i.c.AllocatedBytes(i.name); err == nil {
++		used = max(used, int64(physical))
++	}
++	i.accountSpill(used)
++}
++
++// Charge in-flight writes before releasing the admission lock. Two unrelated
++// items cannot both consume the same final bytes of the volume's dirty window.
++func (i *Item) reserveSpill(add int64) (target int64, release func()) {
++	c := i.c
++	c.spillMu.Lock()
++	own := c.spillResident[i]
++	target = max(int64(0), int64(c.opt.SpillWindow)-(c.spillTotal-own)-c.spillReserved)
++	du, err := diskusage.New(c.root)
++	if err != nil {
++		target = 0
++	} else {
++		reserve := int64(min(uint64(256<<20), max(uint64(2*spillPage), du.Total/10)))
++		target = min(target, max(int64(0), int64(du.Available)-reserve-c.spillReserved)+own)
++	}
++	claim := min(max(int64(0), target-own), max(int64(0), add))
++	c.spillReserved += claim
++	c.spillMu.Unlock()
++	return target, func() { c.spillMu.Lock(); c.spillReserved -= claim; c.spillMu.Unlock() }
++}
++func (i *Item) canBeginSpill(off, n, target int64) bool {
++	if i.c.spill == nil || off < 0 || n <= 0 {
++		return false
++	}
++	return max(i.info.Size, i.info.Rs.Size()+n, off+n) > target
++}
++func (i *Item) beginSpill() error {
++	if i.info.Spill != nil {
++		return i.validSpill()
++	}
++	u, err := uuid.NewRandom()
++	if err != nil {
++		return err
++	}
++	i._dirty()
++	state := &spillState{Version: 2, validated: true, Prefix: i.c.opt.SpillPrefix, Generation: u.String(), Pages: map[int64]spillRef{}, Keys: map[string]bool{}}
++	if i.o != nil && !i.info.Rs.Present(ranges.Range{Size: i.info.Size}) {
++		return i.adoptBase(state)
++	}
++	i.info.Spill = state
++	if err = i.fd.Sync(); err == nil {
++		err = i.saveSpillInfo()
++	}
++	return err
++}
++func (s *spillState) key(hash string) string { return s.Prefix + "/" + s.Generation + "/" + hash }
++func (c *Cache) loadPage(ctx context.Context, s *spillState, ref spillRef) ([]byte, error) {
++	if ref.Bytes <= 0 || ref.Bytes > spillPage {
++		return nil, errors.New("invalid writeback length")
++	}
++	key := s.key(ref.Hash)
++	data := c.spillReads.get(key)
++	if data == nil {
++		var err error
++		data, err = c.spill.ReadSpillChunk(ctx, key)
++		if err != nil {
++			return nil, err
++		}
++		if int64(len(data)) > spillPage || fmt.Sprintf("%x", sha256.Sum256(data)) != ref.Hash {
++			return nil, errors.New("remote spill range failed verification")
++		}
++		c.spillReads.put(key, data)
++	}
++	if int64(len(data)) < ref.Bytes {
++		return nil, errors.New("short remote spill range")
++	}
++	return data[:ref.Bytes], nil
++}
++func eraseResident(rs ranges.Ranges, lo, hi int64) ranges.Ranges {
++	left := rs.Intersection(ranges.Range{Size: lo})
++	return append(left, rs.Intersection(ranges.Range{Pos: hi, Size: 1<<61 - hi})...)
++}
++func (i *Item) sealPage(page int64) error {
++	off := page * spillPage
++	length := min(spillPage, i.info.Size-off)
++	if length <= 0 {
++		return errors.New("invalid local spill extent")
++	}
++	data := make([]byte, length)
++	if _, err := i.fd.ReadAt(data, off); err != nil {
++		return err
++	}
++	return i.persistPage(page, data)
++}
++
++func (i *Item) persistPage(page int64, data []byte) error {
++	off := page * spillPage
++	length := int64(len(data))
++	hash := fmt.Sprintf("%x", sha256.Sum256(data))
++	s := i.info.Spill
++	if _, ok := s.Keys[hash]; !ok {
++		if len(s.Keys) >= maxSpillPages {
++			return errors.New("spill reference limit reached")
++		}
++		s.Keys[hash] = true
++		s.logKey(hash)
++	}
++	if len(s.pending) > 0 || s.Version == 1 {
++		if err := i.saveSpillInfo(); err != nil {
++			return err
++		}
++	}
++	if err := i.c.spill.StoreSpillChunk(i.c.ctx, s.key(hash), data); err != nil {
++		return err
++	}
++	previous, hadPrevious := s.Pages[page]
++	old := i.info.Rs
++	i.info.Rs = eraseResident(old, off, off+spillPage)
++	s.Pages[page] = spillRef{hash, length}
++	s.logPage(page)
++	if err := i.saveSpillInfo(); err != nil {
++		i.info.Rs = old
++		if hadPrevious {
++			s.Pages[page] = previous
++		} else {
++			delete(s.Pages, page)
++		}
++		s.logPage(page)
++		return err
++	}
++	if err := punchSpill(i.fd, off, spillPage); err != nil {
++		i.spillFault = err
++		return err
++	}
++	i.accountDirtySpill()
++	return nil
++}
++
++// Restore the old page locally before admitting an overwrite to it. A failed
++// or interrupted restoration leaves the verified immutable mapping authoritative.
++func (i *Item) restorePage(page int64) error {
++	s := i.info.Spill
++	r, ok := s.Pages[page]
++	if !ok {
++		return nil
++	}
++	data, err := i.c.loadPage(i.c.ctx, s, r)
++	if err != nil {
++		return err
++	}
++	at := page * spillPage
++	n, err := i.fd.WriteAt(data, at)
++	if err != nil {
++		return err
++	}
++	if n != len(data) {
++		return io.ErrShortWrite
++	}
++	if err = i.fd.Sync(); err != nil {
++		return err
++	}
++	delete(s.Pages, page)
++	s.logPage(page)
++	i.info.Rs.Insert(ranges.Range{Pos: at, Size: int64(n)})
++	if err = i.saveSpillInfo(); err != nil {
++		return err
++	}
++	return nil
++}
++func (i *Item) writeSpill(b []byte, off, target int64) (n int, err error) {
++	if i.fd == nil || off < 0 || off > maxSpillPages*spillPage-int64(len(b)) {
++		return 0, syscall.EFBIG
++	}
++	i._dirty()
++	if err = i.beginSpill(); err != nil {
++		return 0, err
++	}
++	for len(b) > 0 {
++		page := off / spillPage
++		take := min(int64(len(b)), spillPage-off%spillPage)
++		// Prefer retaining the page that Finder is still filling.
++
++		for i.info.Rs.Size()+take > target && len(i.info.Rs) > 0 {
++			if batched, e := i.sealBatch(page); e != nil {
++				return n, e
++			} else if batched {
++				continue
++			}
++			first := i.info.Rs[0].Pos / spillPage
++			if first == page {
++				last := i.info.Rs[len(i.info.Rs)-1]
++				first = (last.End() - 1) / spillPage
++				if first == page {
++					break
++				}
++			}
++			if err = i.sealPage(first); err != nil {
++				return n, err
++			}
++		}
++		if target < spillPage || (i.info.Spill.Pages[page].Bytes+i.info.Rs.Size() > target) {
++			// Other writers or low free space may have consumed the whole local
++			// budget. Compose this page in memory and commit its remote reference
++			// without allocating another local block.
++			at := page * spillPage
++			old := max(int64(0), min(spillPage, i.info.Size-at))
++			data := make([]byte, max(old, off-at+take))
++			if old > 0 {
++				if _, err = i.readSpillAt(i.c.ctx, i.fd, data[:old], at); err != nil {
++					return n, err
++				}
++			}
++			copy(data[off-at:], b[:take])
++			if end := off + take; end > i.info.Size {
++				if err = i.fd.Truncate(end); err != nil {
++					return n, err
++				}
++				i.info.Size = end
++			}
++			if err = i.persistPage(page, data); err != nil {
++				return n, err
++			}
++			n += int(take)
++			off += take
++			b = b[take:]
++			continue
++		}
++		if err = i.restorePage(page); err != nil {
++			return n, err
++		}
++		// Extend sparsely first. APFS can otherwise speculatively allocate a
++		// large tail when a tiny write extends a large sparse inode.
++		if end := off + take; end > i.info.Size {
++			if err = i.fd.Truncate(end); err != nil {
++				return n, err
++			}
++		}
++		count, e := i.fd.WriteAt(b[:take], off)
++		if e != nil {
++			return n, e
++		}
++		if int64(count) != take {
++			return n, io.ErrShortWrite
++		}
++		i.info.Rs.Insert(ranges.Range{Pos: off, Size: take})
++		i.info.Size = max(i.info.Size, off+take)
++		off += take
++		b = b[take:]
++		n += count
++	}
++	// APFS may preallocate extra physical blocks for sparse extensions. Use
++	// physical usage to trim any reservation that exceeds the dirty budget.
++	if err = i.fd.Sync(); err != nil {
++		i.spillFault = err
++		return 0, err
++	}
++	for len(i.info.Rs) > 0 {
++		used, e := i.c.AllocatedBytes(i.name)
++		if e != nil {
++			return n, e
++		}
++		if used <= uint64(target) {
++			break
++		}
++		if e = i.sealPage(i.info.Rs[0].Pos / spillPage); e != nil {
++			return n, e
++		}
++	}
++	i.accountDirtySpill()
++	// Writes into resident pages survive abrupt owner termination. The metadata
++	// is ordered after data so a receipt never promises an unflushed local range.
++	err = i.saveSpillInfo()
++	if err != nil {
++		i.spillFault = err
++		return 0, err
++	}
++	return n, nil
++}
++func (i *Item) truncateSpill(size int64) error {
++	if size < 0 || size > maxSpillPages*spillPage {
++		return syscall.EFBIG
++	}
++	if i.fd == nil {
++		return os.ErrClosed
++	}
++	i._dirty()
++	if err := i.fd.Truncate(size); err != nil {
++		return err
++	}
++	s := i.info.Spill
++	for p, r := range s.Pages {
++		valid := size - p*spillPage
++		if valid <= 0 {
++			delete(s.Pages, p)
++			s.logPage(p)
++		} else if valid < r.Bytes {
++			r.Bytes = valid
++			s.Pages[p] = r
++			s.logPage(p)
++		}
++	}
++	i.info.Size = size
++	i.info.Rs = i.info.Rs.Intersection(ranges.Range{Size: size})
++	if err := i.fd.Sync(); err != nil {
++		i.spillFault = err
++		return err
++	}
++	err := i.saveSpillInfo()
++	if err != nil {
++		i.spillFault = err
++	}
++	i.accountDirtySpill()
++	return err
++}
++func (i *Item) readSpillAt(ctx context.Context, fd *os.File, b []byte, off int64) (n int, err error) {
++	if err = i.validSpill(); err != nil {
++		return 0, err
++	}
++	if off < 0 {
++		return 0, syscall.EINVAL
++	}
++	if len(b) == 0 {
++		return 0, nil
++	}
++	if off >= i.info.Size {
++		return 0, io.EOF
++	}
++	for len(b) > 0 && off < i.info.Size {
++		page := off / spillPage
++		within := off % spillPage
++		take := min(int64(len(b)), spillPage-within, i.info.Size-off)
++		out := b[:take]
++		if r, ok := i.info.Spill.Pages[page]; ok {
++			clear(out)
++			if within < r.Bytes {
++				data, e := i.c.loadPage(ctx, i.info.Spill, r)
++				if e != nil {
++					return n, e
++				}
++				copy(out, data[within:])
++			}
++		} else if nr, e := fd.ReadAt(out, off); int64(nr) != take {
++			if e == nil {
++				e = io.ErrUnexpectedEOF
++			}
++			return n, e
++		}
++		n += int(take)
++		off += take
++		b = b[take:]
++	}
++	if len(b) > 0 {
++		return n, io.EOF
++	}
++	return n, nil
++}
++
++// The final destination is a regular object. At most one 4 MiB source page is
++// fetched at a time, including when the provider uses a multipart publisher.
++type spillStream struct {
++	i    *Item
++	ctx  context.Context
++	fd   *os.File
++	off  int64
++	page []byte
++	hash hash.Hash
++}
++
++func (r *spillStream) Read(out []byte) (int, error) {
++	if len(out) == 0 {
++		return 0, nil
++	}
++	if len(r.page) == 0 {
++		if r.off >= r.i.info.Size {
++			return 0, io.EOF
++		}
++		r.page = make([]byte, min(spillPage, r.i.info.Size-r.off))
++		n, e := r.i.readSpillAt(r.ctx, r.fd, r.page, r.off)
++		if e != nil || n != len(r.page) {
++			if e == nil {
++				e = io.ErrUnexpectedEOF
++			}
++			return 0, e
++		}
++	}
++	n := copy(out, r.page)
++	r.page = r.page[n:]
++	r.off += int64(n)
++	_, _ = r.hash.Write(out[:n])
++	return n, nil
++}
++func (i *Item) publishSpill(ctx context.Context, storeFn StoreFn) error {
++	if e := i.validSpill(); e != nil {
++		return e
++	}
++	if i.spillFault != nil {
++		return i.spillFault
++	}
++	if i.opens != 0 {
++		return errors.New("spill generation still open")
++	}
++	fd, e := os.Open(i.c.toOSPath(i.name))
++	if e != nil {
++		return e
++	}
++	defer fd.Close()
++	i.spillWorkers++
++	defer func() { i.spillWorkers-- }()
++	i.spillPublishing = make(chan struct{})
++	pending := i.spillPublishing
++	defer func() {
++		if i.spillPublishing == pending {
++			close(pending)
++			i.spillPublishing = nil
++		}
++	}()
++	s := i.info.Spill
++	name, size, mtime := i.name, i.info.Size, i.info.ModTime
++	snapshot := &Item{info: i.info, c: i.c}
++	reader := &spillStream{i: snapshot, ctx: ctx, fd: fd, hash: sha256.New()}
++	var published fs.Object
++	unlockMutexForCall(&i.mu, func() {
++		info := object.NewStaticObjectInfo(name, mtime, size, true, nil, i.c.fremote)
++		published, e = i.c.fremote.Put(ctx, reader, info)
++		if e != nil {
++			return
++		}
++		if published == nil || published.Size() != size || reader.off != size {
++			e = errors.New("incomplete writeback")
++			return
++		}
++		var got io.ReadCloser
++		got, e = published.Open(ctx)
++		if e != nil {
++			return
++		}
++		h := sha256.New()
++		var n int64
++		n, e = io.Copy(h, io.LimitReader(got, size+1))
++		ce := got.Close()
++		if e == nil {
++			e = ce
++		}
++		if e == nil && (n != size || !bytes.Equal(h.Sum(nil), reader.hash.Sum(nil))) {
++			e = errors.New("published writeback failed independent readback")
++		}
++	})
++	if e != nil {
++		return e
++	}
++	ticket, e := i.stageCleanup()
++	if e != nil {
++		return e
++	}
++	i.o = published
++	i._updateFingerprint()
++	i.info.Spill = nil
++	i.info.Dirty = false
++	if e = i.saveSpillInfo(); e != nil {
++		i.info.Spill = s
++		i.info.Dirty = true
++		return e
++	}
++	i.accountSpill(0)
++	if storeFn != nil {
++		unlockMutexForCall(&i.mu, func() { storeFn(published) })
++	}
++	// Readers may use the published destination while the private ticket drains.
++	close(pending)
++	i.spillPublishing = nil
++	unlockMutexForCall(&i.mu, func() {
++		if err := i.c.finishCleanup(ctx, ticket); err != nil {
++			fs.Errorf(name, "retained private writeback cleanup: %v", err)
++		}
++	})
++	return nil
++}
+--- /dev/null
++++ b/vfs/vfscache/spill_adopt.go
+@@ -0,0 +1,137 @@
++// Modified for CloudDrive: convert an incompletely hydrated existing file without
++// materializing its old bytes on the cache volume.
++package vfscache
++
++import (
++	"context"
++	"crypto/sha256"
++	"errors"
++	"fmt"
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/lib/ranges"
++	"io"
++	"os"
++	"path/filepath"
++)
++
++// An adoption is private preparation. Until the complete metadata swap, the old
++// object and every dirty local interval remain authoritative. A single conditional
++// GET supplies the original bytes while local acknowledged changes take precedence.
++func (i *Item) adoptBase(s *spillState) error {
++	p, ok := i.c.spill.(interface {
++		OpenSpillBase(context.Context, fs.Object) (io.ReadCloser, error)
++	})
++	if !ok {
++		return errors.New("provider lacks conditional base snapshot")
++	}
++	if i.info.Size > maxSpillPages*spillPage {
++		return errors.New("spill source too large")
++	}
++	in, err := p.OpenSpillBase(i.c.ctx, i.o)
++	if err != nil {
++		return err
++	}
++	defer in.Close()
++	s.AdoptingName = i.name
++	prep := filepath.Join(i.c.spillAux, s.Generation+".adopting")
++	staged := &Item{c: i.c, name: i.name, info: i.info}
++	staged.info.Spill = s
++	staged.info.Dirty = true
++	staged.info.Rs = append(ranges.Ranges(nil), i.info.Rs...)
++	if err = staged.commitSpillIndexAt(prep); err != nil {
++		return err
++	}
++	// A pre-publication failure leaves the original authoritative. Its private
++	// generation can then be cleaned independently, including after owner restart.
++	committed := false
++	defer func() {
++		if !committed {
++			if err := i.c.retireAdoption(prep); err != nil {
++				fs.Errorf(i.name, "retained private adoption for recovery: %v", err)
++			}
++		}
++	}()
++	for off := int64(0); off < i.info.Size; off += spillPage {
++		size := min(spillPage, i.info.Size-off)
++		part := ranges.Range{Pos: off, Size: size}
++		remoteBytes := max(int64(0), min(size, i.o.Size()-off))
++		if i.info.Rs.Present(part) {
++			if _, err = io.CopyN(io.Discard, in, remoteBytes); err != nil {
++				return err
++			}
++			continue
++		}
++		data := make([]byte, size)
++		if _, err = io.ReadFull(in, data[:remoteBytes]); err != nil {
++			return err
++		}
++		for _, present := range i.info.Rs.Intersection(part) {
++			if _, err = i.fd.ReadAt(data[present.Pos-off:present.End()-off], present.Pos); err != nil {
++				return err
++			}
++		}
++		digest := fmt.Sprintf("%x", sha256.Sum256(data))
++		if !s.Keys[digest] {
++			s.Keys[digest] = true
++			s.logKey(digest)
++			if err = staged.commitSpillIndexAt(prep); err != nil {
++				return err
++			}
++			if err = i.c.spill.StoreSpillChunk(i.c.ctx, s.key(digest), data); err != nil {
++				return err
++			}
++		}
++		page := off / spillPage
++		s.Pages[page] = spillRef{digest, size}
++		s.logPage(page)
++		staged.info.Rs = eraseResident(staged.info.Rs, off, off+spillPage)
++	}
++	if err = i.fd.Sync(); err != nil {
++		return err
++	}
++	if err = staged.commitSpillIndexAt(prep); err != nil {
++		return err
++	}
++	if err = staged.saveSpillInfo(); err != nil {
++		return err
++	}
++	i.info = staged.info
++	committed = true
++	if err = i.c.reclaimSealed(i); err != nil {
++		i.spillFault = err
++		return err
++	}
++	if err = os.Remove(prep); err != nil && !os.IsNotExist(err) {
++		fs.Errorf(i.name, "retained adoption checkpoint: %v", err)
++	}
++	i.accountDirtySpill()
++	return nil
++}
++func (c *Cache) retireAdoption(path string) error {
++	var info Info
++	if err := readSpillRecord(path, &info); err != nil {
++		return err
++	}
++	s := info.Spill
++	if s == nil || s.AdoptingName == "" || clean(s.AdoptingName) != s.AdoptingName || filepath.IsAbs(s.AdoptingName) || filepath.Base(path) != s.Generation+".adopting" {
++		return errors.New("invalid adoption checkpoint")
++	}
++	// Confirm any live mapping before validating an old preparation checkpoint.
++	// A completed adoption's index may have subsequently been reclaimed.
++	var live Info
++	err := readSpillRecord(c.toOSPathMeta(s.AdoptingName), &live)
++	if err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	if live.Spill != nil && live.Spill.Generation == s.Generation {
++		return os.Remove(path)
++	}
++	temp := Item{c: c, name: s.AdoptingName, info: info}
++	if err = temp.validSpill(); err != nil {
++		return err
++	}
++	if _, err = temp.stageCleanup(); err != nil {
++		return err
++	}
++	return os.Remove(path)
++}
+--- /dev/null
++++ b/vfs/vfscache/spill_batch.go
+@@ -0,0 +1,123 @@
++// Modified for CloudDrive. Reclaim consecutive complete pages together to overlap
++// WAN requests. The item lock protects the selected bytes until their mappings commit.
++package vfscache
++
++import (
++	"context"
++	"crypto/sha256"
++	"fmt"
++	"sync"
++
++	"github.com/rclone/rclone/lib/ranges"
++)
++
++const spillBatchSize = 4
++
++// Each worker owns one mounted volume. Across all active items, at most four
++// batch payloads are admitted. Contention leaves the existing single-page path available.
++var spillBatchSlots = make(chan struct{}, spillBatchSize)
++
++func (i *Item) sealBatch(current int64) (bool, error) {
++	var pages []int64
++	for _, r := range i.info.Rs {
++		for p := (r.Pos + spillPage - 1) / spillPage; (p+1)*spillPage <= r.End() && len(pages) < spillBatchSize; p++ {
++			if p != current {
++				pages = append(pages, p)
++			}
++		}
++		if len(pages) == spillBatchSize {
++			break
++		}
++	}
++	if len(pages) < 2 {
++		return false, nil
++	}
++	reserved := 0
++reserve:
++	for reserved < len(pages) {
++		select {
++		case spillBatchSlots <- struct{}{}:
++			reserved++
++		default:
++			break reserve
++		}
++	}
++	defer func() {
++		for j := 0; j < reserved; j++ {
++			<-spillBatchSlots
++		}
++	}()
++	if reserved < 2 {
++		return false, nil
++	}
++	pages = pages[:reserved]
++	s := i.info.Spill
++	type chunk struct {
++		data []byte
++		hash string
++		err  error
++	}
++	chunks := make([]chunk, len(pages))
++	for j, page := range pages {
++		b := make([]byte, spillPage)
++		if _, err := i.fd.ReadAt(b, page*spillPage); err != nil {
++			return false, err
++		}
++		h := fmt.Sprintf("%x", sha256.Sum256(b))
++		if !s.Keys[h] {
++			if len(s.Keys) >= maxSpillPages {
++				return false, fmt.Errorf("spill reference limit reached")
++			}
++			s.Keys[h] = true
++			s.logKey(h)
++		}
++		chunks[j] = chunk{data: b, hash: h}
++	}
++	// Never dispatch a PUT until every attempted key has a durable owner.
++	if err := i.saveSpillInfo(); err != nil {
++		return false, err
++	}
++	var wg sync.WaitGroup
++	ctx, cancel := context.WithCancel(i.c.ctx)
++	defer cancel()
++	for j := range chunks {
++		wg.Add(1)
++		go func(j int) {
++			defer wg.Done()
++			c := &chunks[j]
++			c.err = i.c.spill.StoreSpillChunk(ctx, s.key(c.hash), c.data)
++			if c.err != nil {
++				cancel()
++			}
++		}(j)
++	}
++	wg.Wait()
++	for _, c := range chunks {
++		if c.err != nil {
++			return false, c.err
++		}
++	}
++	old := append(ranges.Ranges(nil), i.info.Rs...)
++	for j, page := range pages {
++		off := page * spillPage
++		i.info.Rs = eraseResident(i.info.Rs, off, off+spillPage)
++		s.Pages[page] = spillRef{chunks[j].hash, spillPage}
++		s.logPage(page)
++	}
++	if err := i.saveSpillInfo(); err != nil {
++		i.info.Rs = old
++		for _, page := range pages {
++			delete(s.Pages, page)
++			s.logPage(page)
++		}
++		return false, err
++	}
++	for _, page := range pages {
++		if err := punchSpill(i.fd, page*spillPage, spillPage); err != nil {
++			i.spillFault = err
++			return false, err
++		}
++	}
++	i.accountDirtySpill()
++	return true, nil
++}
+--- /dev/null
++++ b/vfs/vfscache/spill_darwin.go
+@@ -0,0 +1,22 @@
++//go:build darwin
++
++package vfscache
++
++import (
++	"golang.org/x/sys/unix"
++	"os"
++	"unsafe"
++)
++
++func punchSpill(fd *os.File, off, length int64) error {
++	req := struct {
++		Flags          uint32
++		Reserved       uint32
++		Offset, Length int64
++	}{Offset: off, Length: length}
++	_, _, e := unix.Syscall(unix.SYS_FCNTL, fd.Fd(), unix.F_PUNCHHOLE, uintptr(unsafe.Pointer(&req)))
++	if e != 0 {
++		return e
++	}
++	return nil
++}
+--- /dev/null
++++ b/vfs/vfscache/spill_index.go
+@@ -0,0 +1,170 @@
++// Modified for CloudDrive: append only changed mappings before committing their
++// verified prefix in the atomic item metadata. Uncommitted tails are ignored.
++package vfscache
++
++import (
++	"bufio"
++	"crypto/sha256"
++	"encoding/binary"
++	"encoding/hex"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
++)
++
++type indexRecord [45]byte
++
++const indexRecordSize = 45
++
++func (s *spillState) logKey(hash string) {
++	if s.Version != 2 {
++		return
++	}
++	var rec indexRecord
++	rec[0] = 1
++	hex.Decode(rec[13:], []byte(hash))
++	s.pending = append(s.pending, rec)
++}
++func (s *spillState) logPage(page int64) {
++	if s.Version != 2 {
++		return
++	}
++	var rec indexRecord
++	rec[0] = 3
++	binary.BigEndian.PutUint64(rec[1:9], uint64(page))
++	if ref, ok := s.Pages[page]; ok {
++		rec[0] = 2
++		binary.BigEndian.PutUint32(rec[9:13], uint32(ref.Bytes))
++		hex.Decode(rec[13:], []byte(ref.Hash))
++	}
++	s.pending = append(s.pending, rec)
++}
++func chainIndex(prev [32]byte, record indexRecord) [32]byte {
++	var block [32 + indexRecordSize]byte
++	copy(block[:32], prev[:])
++	copy(block[32:], record[:])
++	return sha256.Sum256(block[:])
++}
++func (i *Item) indexPath() string {
++	return filepath.Join(i.c.spillAux, i.info.Spill.Generation+".index")
++}
++func (i *Item) commitSpillIndex() error {
++	return i.commitSpillIndexAt(i.c.toOSPathMeta(i.name))
++}
++func (i *Item) commitSpillIndexAt(meta string) error {
++	info := i.info
++	s := info.Spill
++	if s == nil || s.Version == 1 {
++		return durableJSONIn(i.c.spillAux, meta, &info)
++	}
++	snapshot := *s
++	snapshot.Pages = nil
++	snapshot.Keys = nil
++	if len(s.pending) > 0 {
++		f, err := os.OpenFile(i.indexPath(), os.O_CREATE|os.O_RDWR, 0600)
++		if err != nil {
++			return err
++		}
++		if _, err = f.Seek(s.IndexBytes, io.SeekStart); err == nil {
++			w := bufio.NewWriter(f)
++			for _, record := range s.pending {
++				if _, err = w.Write(record[:]); err != nil {
++					break
++				}
++				snapshot.IndexDigest = chainIndex(snapshot.IndexDigest, record)
++				snapshot.IndexBytes += indexRecordSize
++			}
++			if err == nil {
++				err = w.Flush()
++			}
++			if err == nil {
++				err = f.Sync()
++			}
++		}
++		if closeErr := f.Close(); err == nil {
++			err = closeErr
++		}
++		if err != nil {
++			return err
++		}
++		if s.IndexBytes == 0 {
++			d, err := os.Open(i.c.spillAux)
++			if err != nil {
++				return err
++			}
++			err = d.Sync()
++			d.Close()
++			if err != nil {
++				return err
++			}
++		}
++	}
++	info.Spill = &snapshot
++	if err := durableJSONIn(i.c.spillAux, meta, &info); err != nil {
++		return err
++	}
++	s.IndexBytes = snapshot.IndexBytes
++	s.IndexDigest = snapshot.IndexDigest
++	s.pending = nil
++	return nil
++}
++func (i *Item) readSpillIndex() error {
++	s := i.info.Spill
++	if s.IndexBytes < 0 || s.IndexBytes%indexRecordSize != 0 || s.Keys != nil || s.Pages != nil {
++		return errors.New("invalid committed spill index")
++	}
++	keys := make(map[string]bool)
++	pages := make(map[int64]spillRef)
++	var digest [32]byte
++	if s.IndexBytes > 0 {
++		f, err := os.Open(i.indexPath())
++		if err != nil {
++			return err
++		}
++		defer f.Close()
++		st, err := f.Stat()
++		if err != nil {
++			return err
++		}
++		if !st.Mode().IsRegular() || st.Size() < s.IndexBytes {
++			return errors.New("short spill index")
++		}
++		r := bufio.NewReader(f)
++		for off := int64(0); off < s.IndexBytes; off += indexRecordSize {
++			var rec indexRecord
++			if _, err := io.ReadFull(r, rec[:]); err != nil {
++				return err
++			}
++			digest = chainIndex(digest, rec)
++			page := binary.BigEndian.Uint64(rec[1:9])
++			length := int64(binary.BigEndian.Uint32(rec[9:13]))
++			if page >= maxSpillPages {
++				return errors.New("invalid spill index offset")
++			}
++			switch rec[0] {
++			case 1:
++				keys[hex.EncodeToString(rec[13:])] = true
++			case 2:
++				hash := hex.EncodeToString(rec[13:])
++				if !keys[hash] || length <= 0 || length > spillPage {
++					return errors.New("unowned spill mapping")
++				}
++				pages[int64(page)] = spillRef{hash, length}
++			case 3:
++				delete(pages, int64(page))
++			default:
++				return errors.New("unknown spill index operation")
++			}
++			if len(keys) > maxSpillPages {
++				return errors.New("oversized spill index")
++			}
++		}
++	}
++	if digest != s.IndexDigest {
++		return errors.New("spill index checksum mismatch")
++	}
++	s.Keys = keys
++	s.Pages = pages
++	return nil
++}
+--- /dev/null
++++ b/vfs/vfscache/spill_index_test.go
+@@ -0,0 +1,59 @@
++//go:build darwin
++
++// Modified for CloudDrive.
++package vfscache
++
++import (
++	"crypto/sha256"
++	"fmt"
++	"github.com/stretchr/testify/require"
++	"os"
++	"testing"
++)
++
++func TestVerifiedSpillLargeIndex(t *testing.T) {
++	c, i, _ := setupSpillTest(t)
++	i.mu.Lock()
++	require.NoError(t, i.beginSpill())
++	i.mu.Unlock()
++	s := i.info.Spill
++	// 76,800 distinct segments represent 300 GiB of mapped content.
++	for page := int64(0); page < 76800; page++ {
++		key := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprint(page))))
++		s.Keys[key] = true
++		s.logKey(key)
++		s.Pages[page] = spillRef{key, spillPage}
++		s.logPage(page)
++	}
++	require.NoError(t, i.saveSpillInfo())
++	initial := s.IndexBytes
++	delete(s.Pages, 17)
++	s.logPage(17)
++	require.NoError(t, i.saveSpillInfo())
++	require.Equal(t, int64(indexRecordSize), s.IndexBytes-initial)
++	meta, err := os.Stat(c.toOSPathMeta(i.name))
++	require.NoError(t, err)
++	require.Less(t, meta.Size(), int64(2048))
++	replay := &Item{c: c, name: i.name}
++	_, err = replay.load()
++	require.NoError(t, err)
++	require.Equal(t, 76799, len(replay.info.Spill.Pages))
++	require.Equal(t, s.Pages[76799], replay.info.Spill.Pages[76799])
++	require.False(t, replay.info.Spill.Keys["bad"])
++	fd, err := os.OpenFile(i.indexPath(), os.O_WRONLY, 0)
++	require.NoError(t, err)
++	_, err = fd.WriteAt([]byte{1, 2, 3}, s.IndexBytes)
++	require.NoError(t, err)
++	require.NoError(t, fd.Close())
++	replay = &Item{c: c, name: i.name}
++	_, err = replay.load()
++	require.NoError(t, err)
++	fd, err = os.OpenFile(i.indexPath(), os.O_WRONLY, 0)
++	require.NoError(t, err)
++	_, err = fd.WriteAt([]byte{0xf0}, s.IndexBytes-1)
++	require.NoError(t, err)
++	require.NoError(t, fd.Close())
++	replay = &Item{c: c, name: i.name}
++	_, err = replay.load()
++	require.Error(t, err)
++}
+--- /dev/null
++++ b/vfs/vfscache/spill_other.go
+@@ -0,0 +1,12 @@
++//go:build !darwin
++
++package vfscache
++
++import (
++	"errors"
++	"os"
++)
++
++func punchSpill(fd *os.File, off, length int64) error {
++	return errors.New("bounded writeback needs a sparse-file hole-punch implementation")
++}
+--- /dev/null
++++ b/vfs/vfscache/spill_read.go
+@@ -0,0 +1,37 @@
++// Modified for CloudDrive. A small volume-wide cache lets consecutive NFS READs
++// share one verified immutable chunk. Never hold its mutex during network I/O.
++package vfscache
++
++import "sync"
++
++type verifiedPage struct {
++	key  string
++	data []byte
++}
++type spillReadCache struct {
++	mu    sync.Mutex
++	pages [4]verifiedPage
++	next  int
++}
++
++func (c *spillReadCache) get(key string) []byte {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	for _, page := range c.pages {
++		if page.key == key {
++			return page.data
++		}
++	}
++	return nil
++}
++func (c *spillReadCache) put(key string, data []byte) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	for _, page := range c.pages {
++		if page.key == key {
++			return
++		}
++	}
++	c.pages[c.next] = verifiedPage{key, data}
++	c.next = (c.next + 1) % len(c.pages)
++}
+--- /dev/null
++++ b/vfs/vfscache/spill_read_test.go
+@@ -0,0 +1,44 @@
++//go:build darwin
++
++package vfscache
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"fmt"
++	"github.com/stretchr/testify/require"
++	"testing"
++)
++
++type readCountingProvider struct {
++	*testSpill
++	reads int
++}
++
++func (p *readCountingProvider) ReadSpillChunk(ctx context.Context, key string) ([]byte, error) {
++	p.reads++
++	return p.testSpill.ReadSpillChunk(ctx, key)
++}
++func TestVerifiedSpillSequentialReads(t *testing.T) {
++	c, i, p := setupSpillTest(t)
++	count := &readCountingProvider{testSpill: p}
++	c.spill = count
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	require.NoError(t, i.beginSpill())
++	data := bytes.Repeat([]byte("abcd"), int(spillPage/4))
++	h := fmt.Sprintf("%x", sha256.Sum256(data))
++	s := i.info.Spill
++	p.chunks[s.key(h)] = data
++	s.Pages[0] = spillRef{h, spillPage}
++	i.info.Size = spillPage
++	buf := make([]byte, 32<<10)
++	for pos := int64(0); pos < spillPage; pos += int64(len(buf)) {
++		n, err := i.readSpillAt(context.Background(), i.fd, buf, pos)
++		require.NoError(t, err)
++		require.Equal(t, len(buf), n)
++		require.True(t, bytes.Equal(buf, data[pos:pos+int64(n)]))
++	}
++	require.Equal(t, 1, count.reads)
++}
+--- /dev/null
++++ b/vfs/vfscache/spill_recovery.go
+@@ -0,0 +1,191 @@
++// Modified for CloudDrive: local ownership records and restart-safe private-object cleanup.
++package vfscache
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/google/uuid"
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/config"
++	"golang.org/x/sync/errgroup"
++)
++
++const maxSpillRecord = 192 << 20
++
++func readSpillRecord(path string, v any) error {
++	f, err := os.Open(path)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	stat, err := f.Stat()
++	if err != nil {
++		return err
++	}
++	if !stat.Mode().IsRegular() || stat.Size() > maxSpillRecord {
++		return errors.New("invalid writeback metadata record")
++	}
++	d := json.NewDecoder(io.LimitReader(f, maxSpillRecord+1))
++	if err = d.Decode(v); err != nil {
++		return err
++	}
++	if d.Decode(new(any)) != io.EOF {
++		return errors.New("trailing writeback metadata")
++	}
++	return nil
++}
++func (c *Cache) checkSpillBinding() error {
++	c.spillAux = filepath.Join(config.GetCacheDir(), "clouddrive-writeback-v1", fmt.Sprintf("%x", sha256.Sum256([]byte(c.metaRoot))))
++	marker := filepath.Join(c.spillAux, "binding.json")
++	var recorded string
++	e := readSpillRecord(marker, &recorded)
++	if e == nil {
++		if !spillPrefixRE.MatchString(recorded) || recorded != c.opt.SpillPrefix {
++			return errors.New("cache belongs to another writeback namespace")
++		}
++		return nil
++	}
++	if !os.IsNotExist(e) {
++		return e
++	}
++	return nil
++}
++
++// Pin the local cache only after the provider has verified its ownership marker.
++func (c *Cache) recordSpillBinding() error {
++	if err := os.MkdirAll(c.spillAux, 0700); err != nil {
++		return err
++	}
++	marker := filepath.Join(c.spillAux, "binding.json")
++	var existing string
++	if e := readSpillRecord(marker, &existing); e == nil {
++		if existing != c.opt.SpillPrefix {
++			return errors.New("cache binding changed during startup")
++		}
++		return nil
++	} else if !os.IsNotExist(e) {
++		return e
++	}
++	return durableJSONIn(c.spillAux, marker, c.opt.SpillPrefix)
++
++}
++func (c *Cache) validateSpillRecovery() error {
++	// Validate every metadata record before legacy reload can discard an orphan.
++	return c.walk(c.metaRoot, func(path string, fi os.FileInfo, name string) error {
++		if fi.IsDir() {
++			return nil
++		}
++		var info Info
++		if err := readSpillRecord(path, &info); err != nil {
++			return fmt.Errorf("retained invalid cache metadata for %q: %w", name, err)
++		}
++		if info.Spill == nil {
++			return nil
++		}
++		item := Item{c: c, name: name, info: info}
++		if err := item.validSpill(); err != nil {
++			return err
++		}
++		local, err := os.Lstat(c.toOSPath(name))
++		if err != nil {
++			return fmt.Errorf("retained incomplete dirty cache: %w", err)
++		}
++		if !local.Mode().IsRegular() || local.Size() < info.Size {
++			return errors.New("dirty cache backing size mismatch")
++		}
++		if err = c.reclaimSealed(&item); err != nil {
++			return err
++		}
++		return nil
++	})
++}
++
++// A crash after saving the remote mapping and before releasing local blocks
++// leaves a redundant copy. Reclaim it before accepting more writes.
++func (c *Cache) reclaimSealed(i *Item) error {
++	if len(i.info.Spill.Pages) == 0 {
++		return nil
++	}
++	fd, err := os.OpenFile(c.toOSPath(i.name), os.O_RDWR, 0)
++	if err != nil {
++		return err
++	}
++	defer fd.Close()
++	for page := range i.info.Spill.Pages {
++		if err = punchSpill(fd, page*spillPage, spillPage); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++type cleanupTicket struct {
++	Name, Prefix, Generation string
++	Keys                     map[string]bool
++}
++
++func (i *Item) stageCleanup() (string, error) {
++	s := i.info.Spill
++	t := cleanupTicket{i.name, s.Prefix, s.Generation, s.Keys}
++	path := filepath.Join(i.c.spillAux, s.Generation+".cleanup")
++	return path, durableJSONIn(i.c.spillAux, path, t)
++}
++func (c *Cache) finishCleanup(ctx context.Context, path string) error {
++	var t cleanupTicket
++	if err := readSpillRecord(path, &t); err != nil {
++		return err
++	}
++	u, err := uuid.Parse(t.Generation)
++	if err != nil || u.Version() != 4 || u.String() != t.Generation || filepath.Base(path) != t.Generation+".cleanup" || t.Prefix != c.opt.SpillPrefix || len(t.Keys) > maxSpillPages || t.Name == "" || clean(t.Name) != t.Name || filepath.IsAbs(t.Name) || t.Name == ".." || strings.HasPrefix(t.Name, "../") {
++		return errors.New("invalid writeback cleanup ticket")
++	}
++	var info Info
++	e := readSpillRecord(c.toOSPathMeta(t.Name), &info)
++	if e != nil && !os.IsNotExist(e) {
++		return e
++	}
++	if e == nil && info.Spill != nil && info.Spill.Generation == t.Generation {
++		return nil
++	}
++	group, work := errgroup.WithContext(ctx)
++	group.SetLimit(4)
++	for h := range t.Keys {
++		if work.Err() != nil {
++			break
++		}
++		key := t.Prefix + "/" + t.Generation + "/" + h
++		group.Go(func() error { return c.spill.DeleteSpillChunk(work, key) })
++	}
++	if err := group.Wait(); err != nil {
++		return err
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if err := os.Remove(filepath.Join(c.spillAux, t.Generation+".index")); err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	return os.Remove(path)
++}
++func (c *Cache) retrySpillCleanup(ctx context.Context) {
++	matches, err := filepath.Glob(filepath.Join(c.spillAux, "*.cleanup"))
++	if err != nil {
++		return
++	}
++	for _, path := range matches {
++		if ctx.Err() != nil {
++			return
++		}
++		if err := c.finishCleanup(ctx, path); err != nil && !os.IsNotExist(err) {
++			fs.Errorf(nil, "retained writeback cleanup ticket: %v", err)
++		}
++	}
++}
+--- /dev/null
++++ b/vfs/vfscache/spill_test.go
+@@ -0,0 +1,286 @@
++//go:build darwin
++
++package vfscache
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"errors"
++	"fmt"
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/object"
++	"github.com/stretchr/testify/require"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++)
++
++type testSpill struct {
++	mu                            sync.Mutex
++	chunks                        map[string][]byte
++	failPut, failDelete, failBase bool
++}
++
++func (b *testSpill) InitSpillNamespace(context.Context, string) error { return nil }
++func (b *testSpill) StoreSpillChunk(_ context.Context, key string, p []byte) error {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	if b.failPut {
++		return errors.New("injected precommit failure")
++	}
++	if !strings.HasSuffix(key, fmt.Sprintf("%x", sha256.Sum256(p))) {
++		return errors.New("wrong digest")
++	}
++	b.chunks[key] = bytes.Clone(p)
++	return nil
++}
++func (b *testSpill) ReadSpillChunk(_ context.Context, key string) ([]byte, error) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	if p, ok := b.chunks[key]; ok {
++		return bytes.Clone(p), nil
++	}
++	return nil, os.ErrNotExist
++}
++func (b *testSpill) DeleteSpillChunk(_ context.Context, key string) error {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	if b.failDelete {
++		return errors.New("retained")
++	}
++	delete(b.chunks, key)
++	return nil
++}
++func setupSpillTest(t *testing.T) (*Cache, *Item, *testSpill) {
++	_, c := newItemTestCache(t)
++	provider := &testSpill{chunks: map[string][]byte{}}
++	c.spill = provider
++	c.spillAux = t.TempDir()
++	c.opt.SpillPrefix = ".clouddrive-spill-" + strings.Repeat("a", 64)
++	c.opt.SpillWindow = fs.SizeSuffix(spillPage * 2)
++	c.spillResident = map[*Item]int64{}
++	i, _ := c.get("ordinary")
++	require.NoError(t, i.Open(nil))
++	return c, i, provider
++}
++func TestVerifiedSpillOverlayRecovery(t *testing.T) {
++	c, i, p := setupSpillTest(t)
++	data := make([]byte, spillPage*6)
++	for k := range data {
++		data[k] = byte((int64(k)/spillPage + 1) * int64(1+k%241))
++	}
++	for pos := int64(0); pos < int64(len(data)); pos += 1 << 20 {
++		n, e := i.WriteAt(data[pos:pos+(1<<20)], pos)
++		require.NoError(t, e)
++		require.Equal(t, 1<<20, n)
++	}
++	require.NotEmpty(t, p.chunks)
++	alloc, e := c.AllocatedBytes("ordinary")
++	require.NoError(t, e)
++	require.LessOrEqual(t, alloc, uint64(spillPage*2+4096))
++	bytesAt := func(pos, n int64) {
++		t.Helper()
++		got := make([]byte, n)
++		count, e := i.ReadAt(got, pos)
++		require.NoError(t, e)
++		require.Equal(t, int(n), count)
++		require.True(t, bytes.Equal(got, data[pos:pos+n]))
++	}
++	bytesAt(spillPage-300, 801)
++	replace := bytes.Repeat([]byte{0xac}, 900)
++	pos := spillPage - 450
++	n, e := i.WriteAt(replace, pos)
++	require.NoError(t, e)
++	require.Equal(t, len(replace), n)
++	copy(data[pos:], replace)
++	bytesAt(pos, 900)
++	cut := spillPage + 1201
++	require.NoError(t, i.Truncate(cut))
++	data = data[:cut]
++	require.NoError(t, i.Truncate(cut+8192))
++	data = append(data, make([]byte, 8192)...)
++	bytesAt(cut-40, 5000)
++	require.ErrorIs(t, i.rename("ordinary", "moved", nil), syscall.EBUSY)
++	require.NoError(t, i.Sync())
++	// A fresh reader sees exactly the last durable mapping. Do not run the dying
++	// instance's upload/cleanup code: the recovery instance owns it from here.
++	require.NoError(t, i.fd.Close())
++	i.fd = nil
++	replay := newItem(c, "ordinary")
++	c.mu.Lock()
++	c.item["ordinary"] = replay
++	c.mu.Unlock()
++	i = replay
++	require.NoError(t, i.Open(nil))
++	bytesAt(0, int64(len(data)))
++	p.failDelete = true
++	require.NoError(t, i.Close(nil))
++	require.NotEmpty(t, p.chunks)
++	obj, e := c.fremote.NewObject(context.Background(), "ordinary")
++	require.NoError(t, e)
++	r, e := obj.Open(context.Background())
++	require.NoError(t, e)
++	got, e := io.ReadAll(r)
++	require.NoError(t, e)
++	require.NoError(t, r.Close())
++	require.True(t, bytes.Equal(got, data))
++	matches, e := filepath.Glob(filepath.Join(c.spillAux, "*.cleanup"))
++	require.NoError(t, e)
++	require.Len(t, matches, 1)
++	p.failDelete = false
++	c.retrySpillCleanup(context.Background())
++	require.Empty(t, p.chunks)
++}
++func TestVerifiedSpillProviderFailureRetainsLocalBytes(t *testing.T) {
++	_, i, p := setupSpillTest(t)
++	payload := bytes.Repeat([]byte{0xce}, int(spillPage*2))
++	_, e := i.WriteAt(payload, 0)
++	require.NoError(t, e)
++	p.failPut = true
++	_, e = i.WriteAt([]byte("more"), int64(len(payload)))
++	require.Error(t, e)
++	got := make([]byte, len(payload))
++	_, e = i.ReadAt(got, 0)
++	require.NoError(t, e)
++	require.True(t, bytes.Equal(got, payload))
++	p.failPut = false
++	_, e = i.WriteAt([]byte("more"), int64(len(payload)))
++	require.NoError(t, e)
++	for k := range p.chunks {
++		p.chunks[k][0] ^= 1
++	}
++	_, e = i.ReadAt(got, 0)
++	require.Error(t, e)
++	require.True(t, i.IsDirty())
++}
++
++func TestVerifiedSpillTruncatedExistingAndVolumeBudget(t *testing.T) {
++	c, i, p := setupSpillTest(t)
++	// First publish under the window, then truncate the existing object and write a
++	// replacement far larger than the window. The old suffix cannot reappear.
++	_, e := i.WriteAt([]byte("old bytes"), 0)
++	require.NoError(t, e)
++	require.NoError(t, i.Close(nil))
++	obj, e := c.fremote.NewObject(context.Background(), "ordinary")
++	require.NoError(t, e)
++	require.NoError(t, i.Open(obj))
++	require.NoError(t, i.Truncate(0))
++	page := bytes.Repeat([]byte{0xab}, int(spillPage))
++	for j := int64(0); j < 4; j++ {
++		page[0] = byte(j)
++		_, e = i.WriteAt(page, j*spillPage)
++		require.NoError(t, e)
++	}
++	require.NotNil(t, i.info.Spill)
++	second, _ := c.get("second")
++	require.NoError(t, second.Open(nil))
++	// Parallel sealing can free several pages at once. Write enough to force
++	// the second writer into staging even if the first has freed its whole window.
++	block := bytes.Repeat([]byte{0xef}, 256<<10)
++	for j := 0; j < 36; j++ {
++		block[0] = byte(j)
++		_, e = second.WriteAt(block, int64(j*len(block)))
++		require.NoError(t, e)
++	}
++	require.NotNil(t, second.info.Spill)
++	total := uint64(0)
++	for _, name := range []string{"ordinary", "second"} {
++		used, err := c.AllocatedBytes(name)
++		require.NoError(t, err)
++		total += used
++	}
++	require.LessOrEqual(t, total, uint64(c.opt.SpillWindow)+8192)
++	require.NoError(t, second.Close(nil))
++	require.NoError(t, i.Close(nil))
++	require.Empty(t, p.chunks)
++}
++
++func (b *testSpill) OpenSpillBase(ctx context.Context, o fs.Object) (io.ReadCloser, error) {
++	if b.failBase {
++		return nil, errors.New("injected base GET failure")
++	}
++	return o.Open(ctx)
++}
++func TestVerifiedSpillColdEditAndAlreadyPublishedAppend(t *testing.T) {
++	ctx := context.Background()
++	c, unused, p := setupSpillTest(t)
++	require.NoError(t, unused.Close(nil))
++	data := make([]byte, 80<<20)
++	for pos := range data {
++		data[pos] = byte((int64(pos)/spillPage + int64(pos%251)) % 256)
++	}
++	obj, e := c.fremote.Put(ctx, bytes.NewReader(data), object.NewStaticObjectInfo("cold", time.Now(), int64(len(data)), true, nil, c.fremote))
++	require.NoError(t, e)
++	i, _ := c.get("cold")
++	require.NoError(t, i.Open(obj))
++	require.Equal(t, int64(len(data)), i.info.Size)
++	p.failBase = true
++	_, e = i.WriteAt([]byte("edit"), int64(8<<20))
++	require.Error(t, e)
++	require.Nil(t, i.info.Spill)
++	require.False(t, i.IsDirty())
++	p.failBase = false
++	_, e = i.WriteAt([]byte("edit"), int64(8<<20))
++	require.NoError(t, e)
++	copy(data[8<<20:], "edit")
++	allocation, e := c.AllocatedBytes("cold")
++	require.NoError(t, e)
++	require.LessOrEqual(t, allocation, uint64(c.opt.SpillWindow))
++	require.NoError(t, i.Close(nil))
++	require.Empty(t, p.chunks)
++	// NFS can pause beyond the writeback delay and resume at a newer offset.
++	// Re-open the published sparse file, leaving a zero-filled gap before the tail.
++	obj, e = c.fremote.NewObject(ctx, "cold")
++	require.NoError(t, e)
++	require.NoError(t, i.Open(obj))
++	data = append(data, make([]byte, 777)...)
++	at := int64(len(data))
++	_, e = i.WriteAt([]byte("tail"), at)
++	require.NoError(t, e)
++	data = append(data, []byte("tail")...)
++	allocation, e = c.AllocatedBytes("cold")
++	require.NoError(t, e)
++	require.LessOrEqual(t, allocation, uint64(c.opt.SpillWindow))
++	require.NoError(t, i.Close(nil))
++	obj, e = c.fremote.NewObject(ctx, "cold")
++	require.NoError(t, e)
++	rd, e := obj.Open(ctx)
++	require.NoError(t, e)
++	got, e := io.ReadAll(rd)
++	require.NoError(t, e)
++	require.NoError(t, rd.Close())
++	require.True(t, bytes.Equal(data, got))
++}
++
++func TestVerifiedSpillCleanerDuringPublication(t *testing.T) {
++	_, i, _ := setupSpillTest(t)
++	_, err := i.WriteAt(make([]byte, spillPage*3), 0)
++	require.NoError(t, err)
++	callback := make(chan struct{})
++	allow := make(chan struct{})
++	ended := make(chan error, 1)
++	go func() { ended <- i.Close(func(fs.Object) { close(callback); <-allow }) }()
++	select {
++	case <-callback:
++	case <-time.After(5 * time.Second):
++		t.Fatal("publisher failed to enter callback")
++	}
++	removed, _ := i.RemoveNotInUse(0, false)
++	require.False(t, removed)
++	state, _, err := i.Reset()
++	require.NoError(t, err)
++	require.Equal(t, SkippedPendingAccess, state)
++	close(allow)
++	select {
++	case e := <-ended:
++		require.NoError(t, e)
++	case <-time.After(5 * time.Second):
++		t.Fatal("cache cleanup deadlocked with publication callback")
++	}
++}
+--- a/vfs/vfscommon/options.go
++++ b/vfs/vfscommon/options.go
+@@ -55,6 +55,16 @@
+ 	Help:    "Translate symlinks to/from regular files with a '" + fs.LinkSuffix + "' extension for the VFS",
+ 	Groups:  "VFS",
+ }, {
++	Name:    "vfs_spill_prefix",
++	Default: "",
++	Help:    "Verified provider-private namespace for bounded dirty writeback",
++	Groups:  "VFS",
++}, {
++	Name:    "vfs_spill_window",
++	Default: fs.SizeSuffix(32 << 20),
++	Help:    "Resident dirty window per eligible open file before verified spill",
++	Groups:  "VFS",
++}, {
+ 	Name:    "vfs_cache_mode",
+ 	Default: CacheModeOff,
+ 	Help:    "Cache mode off|minimal|writes|full",
+@@ -187,6 +197,8 @@
+ 
+ // Options is options for creating the vfs
+ type Options struct {
++	SpillPrefix        string        `config:"vfs_spill_prefix"`
++	SpillWindow        fs.SizeSuffix `config:"vfs_spill_window"`
+ 	MoveBinding        string        `config:"vfs_move_binding"`
+ 	MoveJournal        string        `config:"vfs_move_journal"`
+ 	NoSeek             bool          `config:"no_seek"`        // don't allow seeking if set

@@ -1,5 +1,5 @@
 {
-  "version": "v1.75.2-clouddrive.1",
+  "version": "v1.75.2-clouddrive.10",
   "goVersion": "go1.27.3",
   "platform": "darwin/arm64",
   "cgoEnabled": false,
@@ -22,7 +22,19 @@
   ],
   "patches": {
     "0001-go-nfs-local-allocation.patch": "10bfbbe21568a2bde88688ad1d48df8f8e5f59f03327cdfa7565c3987954146a",
-    "0002-rclone-local-allocation.patch": "0d6d7e8b6cf31eeb6c128716bf1a3244a6295e85c5f1429d8ace96fa615d6e92"
+    "0002-rclone-local-allocation.patch": "0d6d7e8b6cf31eeb6c128716bf1a3244a6295e85c5f1429d8ace96fa615d6e92",
+    "0003-rclone-metadata-changes.patch": "92b702494ea2b97774b2954d59e42f35739736b1355554a193a36d518fed6f9d",
+    "0004-go-nfs-rename-handles.patch": "e2f926e1f80d93f346b877271c210a779968b270d33be3b974ed8a722e5d9db8",
+    "0005-rclone-safe-moves.patch": "3f9cd9112d4df8c5fa8fa06ce93c772cea02dfd84a3a1e0b5fa92b465bac4feb",
+    "0006-rclone-concurrent-moves.patch": "aa6646d2cad311a9715d68e3abbe11547b5bc31198ca1e3c68e1bbb359277f71",
+    "0007-rclone-r2-move-copy.patch": "34154ab120f87f8bc93506fb734856450df2b41e27f437940ccf8acee5f38711",
+    "0008-go-nfs-exclusive-create.patch": "3cf6b8db3c128eea933368627b89576320cf9a92c25504a33f4cb208442bdf5c",
+    "0009-go-nfs-directory-identity.patch": "1579df103a6c85e74fd48853e4574c38c87182ea46a32dc9eb6251bbf6cf0c65",
+    "0010-rclone-lazy-directory-attributes.patch": "d218adf1be585e9830826070a7d5d68ca91be95ce98080f6a129b2067fc41b36",
+    "0011-rclone-s3-spill.patch": "f21248140ab265b6c28aac6b042f254127cf49cbfed56275d501f878ed59579d",
+    "0012-rclone-bounded-writeback.patch": "9fc21d12c9a454e9dae26c4d29d924598c043f6173dd659dee28bd6eda26f0a2",
+    "0013-rclone-r2-directory-markers.patch": "8962fb077468d155e2603ac1fcf62cf4e71263ea3ee94a87a6b64a9af64e2483",
+    "0014-rclone-unlink-publication.patch": "053d3311dd7704df3e0d473fb45c7aaa7fedf18bd496133bc86cb64e208448e1"
   },
   "referencePatchedBinarySHA256": "69ad2e4f2c07bc0b64d436d2bbe586653f55d61e7837ca765eaf3d1ade647052",
   "referenceUpstreamBinarySHA256": "af0257730173748dc9706ad3c83288bf3a0c5d5e9768fef20235e375e9d835e1",

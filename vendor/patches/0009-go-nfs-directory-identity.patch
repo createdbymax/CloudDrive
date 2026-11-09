@@ -1,0 +1,220 @@
+--- a/file.go
++++ b/file.go
+@@ -86,7 +86,21 @@
+ 	return &wcc
+ }
+ 
+-// ToFileAttribute creates an NFS fattr3 struct from an OS.FileInfo
++// listingFileID preserves GETATTR identity without fetching size, allocation or timestamps.
++func listingFileID(info os.FileInfo, filePath string) uint64 {
++	if attr := file.GetInfo(info); attr != nil {
++		return attr.Fileid
++	}
++	return fallbackFileID(filePath)
++}
++
++func fallbackFileID(filePath string) uint64 {
++	hasher := fnv.New64()
++	_, _ = hasher.Write([]byte(filePath))
++	return hasher.Sum64()
++}
++
++// ToFileAttribute constructs complete attributes for a request that needs them.
+ func ToFileAttribute(info os.FileInfo, filePath string) *FileAttribute {
+ 	f := FileAttribute{}
+ 
+@@ -117,9 +131,7 @@
+ 		f.SpecData = [2]uint32{a.Major, a.Minor}
+ 		f.Fileid = a.Fileid
+ 	} else {
+-		hasher := fnv.New64()
+-		_, _ = hasher.Write([]byte(filePath))
+-		f.Fileid = hasher.Sum64()
++		f.Fileid = fallbackFileID(filePath)
+ 	}
+ 
+ 	f.Filesize = uint64(info.Size())
+--- a/nfs_onreaddir.go
++++ b/nfs_onreaddir.go
+@@ -91,9 +91,9 @@
+ 				break
+ 			}
+ 
+-			attrs := ToFileAttribute(c, path.Join(append(p, c.Name())...))
++			fileID := listingFileID(c, path.Join(joinPath(p, c.Name())...))
+ 			entities = append(entities, readDirEntity{
+-				FileID: attrs.Fileid,
++				FileID: fileID,
+ 				Name:   []byte(c.Name()),
+ 				Cookie: cookie,
+ 				Next:   true,
+--- a/nfs_onreaddirplus.go
++++ b/nfs_onreaddirplus.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"bytes"
+ 	"context"
++	"os"
+ 	"path"
+ 
+ 	"github.com/willscott/go-nfs-client/nfs/xdr"
+@@ -25,6 +26,15 @@
+ 	Next       bool
+ }
+ 
++// RFC 1813 allows each READDIRPLUS entry to omit its post-op attributes.
++func directoryPlusAttributes(info os.FileInfo, name string) (uint64, *FileAttribute) {
++	if entry, ok := info.(interface{ DeferDirectoryAttributes() bool }); ok && entry.DeferDirectoryAttributes() {
++		return listingFileID(info, name), nil
++	}
++	attrs := ToFileAttribute(info, name)
++	return attrs.Fileid, attrs
++}
++
+ func joinPath(parent []string, elements ...string) []string {
+ 	joinedPath := make([]string, 0, len(parent)+len(elements))
+ 	joinedPath = append(joinedPath, parent...)
+@@ -103,9 +113,9 @@
+ 
+ 			filePath := joinPath(p, c.Name())
+ 			handle := userHandle.ToHandle(fs, filePath)
+-			attrs := ToFileAttribute(c, path.Join(filePath...))
++			fileID, attrs := directoryPlusAttributes(c, path.Join(filePath...))
+ 			entities = append(entities, readDirPlusEntity{
+-				FileID:     attrs.Fileid,
++				FileID:     fileID,
+ 				Name:       []byte(c.Name()),
+ 				Cookie:     cookie,
+ 				Attributes: attrs,
+--- /dev/null
++++ b/directory_identity_test.go
+@@ -0,0 +1,129 @@
++// Modified for CloudDrive: exercise actual NFSv3 enumeration response encoding.
++package nfs
++
++import (
++	"bytes"
++	"context"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/go-git/go-billy/v5"
++	"github.com/go-git/go-billy/v5/osfs"
++	"github.com/willscott/go-nfs-client/nfs/xdr"
++	nfsfile "github.com/willscott/go-nfs/file"
++)
++
++type remoteListingEntry struct {
++	os.FileInfo
++	slow                        bool
++	sys                         interface{}
++	mtimeCalls, allocationCalls int
++}
++
++func (e *remoteListingEntry) Sys() interface{}               { return e.sys }
++func (e *remoteListingEntry) ModTime() time.Time             { e.mtimeCalls++; return time.Unix(123456, 0) }
++func (e *remoteListingEntry) AllocatedBytes() uint64         { e.allocationCalls++; return 17 }
++func (e *remoteListingEntry) DeferDirectoryAttributes() bool { return e.slow }
++
++type listingFS struct {
++	billy.Filesystem
++	entry os.FileInfo
++}
++
++func (f listingFS) ReadDir(string) ([]os.FileInfo, error) { return []os.FileInfo{f.entry}, nil }
++
++type listingHandler struct {
++	Handler
++	fs listingFS
++}
++
++func (h listingHandler) FromHandle([]byte) (billy.Filesystem, []string, error) { return h.fs, nil, nil }
++func (h listingHandler) ToHandle(_ billy.Filesystem, p []string) []byte        { return []byte(p[len(p)-1]) }
++func (h listingHandler) HandleLimit() int                                      { return 100 }
++func TestDirectoryIdentity(t *testing.T) {
++	local := t.TempDir()
++	name := "neighbor"
++	if err := os.WriteFile(local+"/"+name, []byte("sample"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(local + "/" + name)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, plus := range []bool{false, true} {
++		for _, slow := range []bool{false, true} {
++			for _, sys := range []interface{}{nil, &nfsfile.FileInfo{Fileid: 4294969231}, &nfsfile.FileInfo{Fileid: 0}} {
++				entry := &remoteListingEntry{FileInfo: info, slow: slow, sys: sys}
++				expected := ToFileAttribute(entry, name)
++				entry.mtimeCalls = 0
++				entry.allocationCalls = 0
++				h := listingHandler{fs: listingFS{osfs.New(local), entry}}
++				body := new(bytes.Buffer)
++				w := &response{req: &request{Body: body}, writer: new(bytes.Buffer), responded: true}
++				if plus {
++					if err = xdr.Write(body, readDirPlusArgs{DirCount: 8192, MaxCount: 8192}); err != nil {
++						t.Fatal(err)
++					}
++					err = onReadDirPlus(context.Background(), w, h)
++				} else {
++					if err = xdr.Write(body, readDirArgs{Count: 8192}); err != nil {
++						t.Fatal(err)
++					}
++					err = onReadDir(context.Background(), w, h)
++				}
++				if err != nil {
++					t.Fatal(err)
++				}
++				read := func(target interface{}) {
++					t.Helper()
++					if err := xdr.Read(w.writer, target); err != nil {
++						t.Fatal(err)
++					}
++				}
++				var header struct {
++					Status   uint32
++					Parent   *FileAttribute `xdr:"optional"`
++					Verifier uint64
++					Next     bool
++				}
++				read(&header)
++				if header.Status != 0 || !header.Next {
++					t.Fatal(header)
++				}
++				for i := 0; i < 3; i++ {
++					if plus {
++						var e readDirPlusEntity
++						read(&e)
++						if i == 2 {
++							if e.FileID != expected.Fileid || string(e.Name) != name || e.Handle == nil || string(*e.Handle) != name || e.Next {
++								t.Fatal(e)
++							}
++							if slow && e.Attributes != nil || !slow && (e.Attributes == nil || *e.Attributes != *expected) {
++								t.Fatal(e)
++							}
++						}
++					} else {
++						var e readDirEntity
++						read(&e)
++						if i == 2 && (e.FileID != expected.Fileid || string(e.Name) != name || e.Next) {
++							t.Fatal(e)
++						}
++					}
++				}
++				var eof bool
++				read(&eof)
++				if !eof || w.writer.Len() != 0 {
++					t.Fatal("invalid directory response")
++				}
++				if (!plus || slow) && (entry.mtimeCalls != 0 || entry.allocationCalls != 0) {
++					t.Fatalf("unexpected metadata fetches %d/%d", entry.mtimeCalls, entry.allocationCalls)
++				}
++				// A subsequent explicit attribute request must still obtain the real timestamp and allocation.
++				if got := ToFileAttribute(entry, name); *got != *expected {
++					t.Fatal(got)
++				}
++			}
++		}
++	}
++}

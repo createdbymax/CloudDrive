@@ -1,0 +1,56 @@
+package vfscache
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"github.com/stretchr/testify/require"
+	"io"
+	"os/exec"
+	"testing"
+)
+
+func TestPunchedDirtyRangeNeedsOverlay(t *testing.T) {
+	r, c := newItemTestCache(t)
+	item, _ := c.get("synthetic-large-file")
+	require.NoError(t, item.Open(nil))
+	const m = 1024 * 1024
+	original := make([]byte, 8*m)
+	_, err := rand.Read(original)
+	require.NoError(t, err)
+	n, err := item.WriteAt(original, 0)
+	require.NoError(t, err)
+	require.Equal(t, len(original), n)
+	require.NoError(t, item.Sync())
+	// A verified independent copy exists. The current reader and publisher have no pointer to it.
+	r.WriteObject(context.Background(), "proof-chunk", string(original[2*m:6*m]), item.info.ModTime)
+	objChunk, err := r.Fremote.NewObject(context.Background(), "proof-chunk")
+	require.NoError(t, err)
+	chunk, err := objChunk.Open(context.Background())
+	require.NoError(t, err)
+	saved, err := io.ReadAll(chunk)
+	require.NoError(t, err)
+	require.NoError(t, chunk.Close())
+	require.True(t, sha256.Sum256(saved) == sha256.Sum256(original[2*m:6*m]))
+	py := exec.Command("python3", "-c", "import os,fcntl,sys,struct\nf=open(sys.argv[1],'r+b');os.fsync(f.fileno());s=os.fstat(f.fileno());fcntl.fcntl(f,99,struct.pack('=IIqq',0,0,2097152,4194304));os.fsync(f.fileno());t=os.fstat(f.fileno());assert t.st_size==s.st_size and t.st_blocks<s.st_blocks", c.toOSPath("synthetic-large-file"))
+	out, err := py.CombinedOutput()
+	require.NoError(t, err, "%s", out)
+	actual := make([]byte, len(original))
+	n, err = item.ReadAt(actual, 0)
+	require.NoError(t, err)
+	require.Equal(t, len(actual), n)
+	want := append([]byte(nil), original...)
+	clear(want[2*m : 6*m])
+	require.True(t, bytes.Equal(want, actual), "current reader should see the punched hole as zero")
+	require.NoError(t, item.Close(nil))
+	obj, err := r.Fremote.NewObject(context.Background(), "synthetic-large-file")
+	require.NoError(t, err)
+	reader, err := obj.Open(context.Background())
+	require.NoError(t, err)
+	published, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	require.True(t, bytes.Equal(want, published), "ordinary writeback must exhibit same hazard")
+	t.Logf("logical=%d punched=%d current_read_zeroes=true ordinary_object_zeroes=true verified_companion_available=true", len(original), len(saved))
+}

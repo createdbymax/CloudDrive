@@ -1,0 +1,129 @@
+--- /dev/null
++++ b/backend/s3/clouddrive_move_copy.go
+@@ -0,0 +1,126 @@
++// CloudDrive exclusive moves use R2's destination condition at the copy commit.
++package s3
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"syscall"
++
++	"github.com/aws/aws-sdk-go-v2/aws"
++	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
++	"github.com/aws/aws-sdk-go-v2/service/s3/types"
++	smithyhttp "github.com/aws/smithy-go/transport/http"
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/hash"
++	"github.com/rclone/rclone/lib/bucket"
++)
++
++const moveCopyMetadata = "clouddrive-move-receipt"
++
++// CheckExclusiveMoveCopy rejects unsupported payloads before a move starts copying.
++func (f *Fs) CheckExclusiveMoveCopy(size int64) error {
++	if f.opt.Provider != "Cloudflare" || f.opt.VersionAt.IsSet() || f.opt.Decompress || f.opt.NoHeadObject {
++		return fmt.Errorf("this provider configuration does not support protected CloudDrive copies")
++	}
++	if size < 0 || size > 5<<30 {
++		return fmt.Errorf("protected CloudDrive copy requires a single R2 CopyObject (maximum 5 GiB)")
++	}
++	return nil
++}
++
++func (f *Fs) CopyExclusiveMove(ctx context.Context, source fs.Object, remote, jobID string) (fs.Object, error) {
++	src, ok := source.(*Object)
++	if !ok || src.fs != f || jobID == "" {
++		return nil, fs.ErrorCantCopy
++	}
++	if err := f.CheckExclusiveMoveCopy(src.Size()); err != nil {
++		return nil, err
++	}
++	info, err := src.headObject(ctx)
++	if err != nil {
++		return nil, err
++	}
++	if info.ETag == nil || *info.ETag == "" || info.ContentLength == nil || *info.ContentLength != src.Size() {
++		return nil, fmt.Errorf("source changed before protected copy")
++	}
++	fresh := &Object{fs: f, remote: src.remote}
++	fresh.setMetaData(info)
++	oldMD5, err := src.Hash(ctx, hash.MD5)
++	if err != nil {
++		return nil, err
++	}
++	newMD5, err := fresh.Hash(ctx, hash.MD5)
++	if err != nil {
++		return nil, err
++	}
++	if oldMD5 != newMD5 || !src.ModTime(ctx).Equal(fresh.ModTime(ctx)) {
++		return nil, fmt.Errorf("source changed before protected copy")
++	}
++	// A replay must recognize the precise source version and destination for this job.
++	receipt := copyReceipt(jobID, src.remote, remote, *info.ETag)
++	target := &Object{fs: f, remote: remote}
++	readReceipt := func() (fs.Object, error) {
++		head, e := target.headObject(ctx)
++		if e != nil {
++			return nil, e
++		}
++		if head.Metadata[moveCopyMetadata] != receipt || head.ContentLength == nil || *head.ContentLength != src.Size() {
++			return nil, syscall.EEXIST
++		}
++		target.setMetaData(head)
++		return target, nil
++	}
++	existing, err := readReceipt()
++	if !errors.Is(err, fs.ErrorObjectNotFound) {
++		return existing, err
++	}
++	dstBucket, dstPath := f.split(remote)
++	srcBucket, srcPath := src.split()
++	req := awss3.CopyObjectInput{
++		Bucket: aws.String(dstBucket), Key: aws.String(dstPath), CopySource: aws.String(pathEscape(bucket.Join(srcBucket, srcPath))),
++		CopySourceIfMatch: info.ETag, MetadataDirective: types.MetadataDirective("MERGE"),
++		Metadata: map[string]string{moveCopyMetadata: receipt},
++	}
++	if info.StorageClass != "" {
++		req.StorageClass = types.StorageClass(info.StorageClass)
++	}
++	_, err = f.c.CopyObject(ctx, &req, awss3.WithAPIOptions(smithyhttp.SetHeaderValue("cf-copy-destination-if-none-match", "*")))
++	if err != nil {
++		// A lost response or 412 is successful only with our identical durable receipt.
++		if current, e := readReceipt(); e == nil {
++			return current, nil
++		}
++		return nil, err
++	}
++	return readReceipt()
++}
++
++func copyReceipt(jobID, source, destination, validator string) string {
++	digest := sha256.Sum256([]byte(jobID + "\x00" + source + "\x00" + destination + "\x00" + validator))
++	return hex.EncodeToString(digest[:])
++}
++
++// Verify the latest source version still owns the destination proof immediately before unlink.
++func (f *Fs) VerifyExclusiveMove(ctx context.Context, source fs.Object, remote, jobID string) error {
++	src, ok := source.(*Object)
++	if !ok || src.fs != f || jobID == "" {
++		return fs.ErrorCantCopy
++	}
++	head, err := src.headObject(ctx)
++	if err != nil {
++		return err
++	}
++	target, err := (&Object{fs: f, remote: remote}).headObject(ctx)
++	if err != nil {
++		return err
++	}
++	if head.ETag == nil || head.ContentLength == nil || *head.ContentLength != source.Size() ||
++		target.ContentLength == nil || *target.ContentLength != source.Size() ||
++		target.Metadata[moveCopyMetadata] != copyReceipt(jobID, src.remote, remote, *head.ETag) {
++		return fmt.Errorf("exclusive move source or destination receipt changed")
++	}
++	return nil
++}

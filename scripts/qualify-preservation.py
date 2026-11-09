@@ -4,6 +4,7 @@
 Generated local files only. This measures a candidate flag, not a recovery feature.
 No owner credentials, cache or drive are accessed. Failure fixtures are retained.
 """
+import argparse
 import base64
 import hashlib
 import importlib.util
@@ -23,6 +24,9 @@ spec.loader.exec_module(local)
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--rclone', type=pathlib.Path, default=ROOT/'build/backend/rclone')
+    binary = parser.parse_args().rclone.resolve(strict=True)
     root = pathlib.Path(tempfile.mkdtemp(prefix='clouddrive-preservation-')).resolve()
     root.chmod(0o700)
     source, mount, history = (root/name for name in ('source', 'mount', 'history'))
@@ -35,7 +39,7 @@ def main():
     env = {key: os.environ[key] for key in ('PATH', 'HOME', 'TMPDIR', 'LANG') if key in os.environ}
     env.update(RCLONE_RC_USER='fixture', RCLONE_RC_PASS=token)
     log = (root/'worker.log').open('wb')
-    worker = subprocess.Popen([str(ROOT/'build/backend/rclone'), 'serve', 'nfs', str(source),
+    worker = subprocess.Popen([str(binary), 'serve', 'nfs', str(source),
         '--config', '/dev/null', '--addr', f'127.0.0.1:{nfs}', '--cache-dir', str(root/'cache'),
         '--vfs-cache-mode', 'full', '--vfs-write-back', '1s', '--backup-dir', str(history),
         '--rc', '--rc-addr', f'127.0.0.1:{rc}'], env=env, stdout=log, stderr=log)
@@ -59,7 +63,7 @@ def main():
     try:
         local.until(stats)
         assert stats()['fs'].rstrip('/') == str(source)
-        local.command(['/sbin/mount_nfs', '-o', f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,nodev,nosuid', '127.0.0.1:/', str(mount)])
+        local.command(['/sbin/mount_nfs', '-o', f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,mutejukebox,nodev,nosuid', '127.0.0.1:/', str(mount)])
         assert local.is_mounted(mount)
         local.filesystem('''import os,sys
 from pathlib import Path
@@ -76,7 +80,7 @@ os.replace(p/'replacement.tmp',p/'replace.bin')
         assert (source/'replace.bin').read_bytes() == b'new-replacement'
         recovered = {hashlib.sha256(path.read_bytes()).hexdigest() for path in history.rglob('*') if path.is_file()}
         evidence = {'candidate': '--backup-dir on pinned NFS/VFS backend',
-            'mutationsCommitted': True,
+            'backendSHA256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'mutationsCommitted': True,
             'priorBytesPreserved': {name: hashlib.sha256(data).hexdigest() in recovered for name, data in originals.items()},
             'historyObjectCount': len(recovered), 'remoteProviderTested': False}
         worker.terminate(); worker.wait(timeout=10)

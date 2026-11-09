@@ -8,12 +8,12 @@ struct TransfersView: View {
         let renderDate = Date()
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                Text("Transfers").font(.title2.bold())
+                FinderMovesView(drive: drive)
                 Text(drive.presentation(at: renderDate).title).font(.headline)
                 if let issue = drive.uploadIssue { Label(issue, systemImage: "exclamationmark.triangle").font(.callout) }
                 if drive.running && drive.activityAvailable && UploadFreshness.isFresh(drive.uploadSampledAt, at: renderDate), let snapshot = drive.uploadProgress {
                     if snapshot.isEmpty {
-                        Text("No uploads waiting. An empty queue does not independently verify your cloud files.").foregroundStyle(.secondary)
+                        Text("No Finder uploads waiting. Copy files into CloudDrive in Finder to upload them.").foregroundStyle(.secondary)
                     } else {
                         Picker("Show uploads", selection: $filter) {
                             ForEach(TransferFilter.allCases) { Text($0.rawValue).tag($0) }
@@ -56,10 +56,12 @@ struct TransfersView: View {
                         Text("Retry Now schedules a waiting retry. It does not pause or cancel active uploads.").font(.caption).foregroundStyle(.secondary)
                     }
                 } else {
-                    Text("Live upload details are unavailable. Previous progress and speed are hidden.").foregroundStyle(.secondary)
+                    Text(drive.running ? "Waiting for current transfer details." : "Connect CloudDrive to see transfer progress.").foregroundStyle(.secondary)
                 }
                 OperationFeedback(drive: drive)
-                RecentActivityView(drive: drive)
+                if !drive.diagnostics.isEmpty {
+                    DisclosureGroup("Diagnostic activity") { RecentActivityView(drive: drive) }
+                }
             }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
         }.frame(minWidth: 520, minHeight: 420)
         }

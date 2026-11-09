@@ -31,12 +31,12 @@ struct UploadProgressPanel: View {
                         .accessibilityLabel("Upload needs attention. \(issue)")
                 }
                 if !isConnected {
-                    message("Connect the drive to see upload progress.")
+                    message("Connect Finder browsing to see Finder upload progress.")
                 } else if !queueAvailable {
                     message("Upload activity is unavailable. Previous speed and progress are not shown.")
                 } else if let snapshot {
                     if snapshot.isEmpty {
-                        Label(issue == nil ? "No uploads waiting" : "No queued items reported", systemImage: issue == nil ? "checkmark.circle" : "exclamationmark.triangle")
+                        Label(issue == nil ? "No Finder uploads waiting" : "No queued Finder items reported", systemImage: issue == nil ? "checkmark.circle" : "exclamationmark.triangle")
                             .foregroundStyle(.secondary)
                         Text(issue == nil ? "An idle queue does not independently verify your cloud files." : "An empty queue does not mean the reported problem is resolved.")
                             .font(.caption)

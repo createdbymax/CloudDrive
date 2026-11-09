@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Stable code-signing selection. Never changes Keychain ACLs or creates certificates."""
-import hashlib, json, os, pathlib, re, subprocess, sys
+import hashlib, json, os, pathlib, re, subprocess, sys, plistlib, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 APP_ID = 'local.bucketdrive.app'
@@ -71,7 +71,33 @@ def codesign_args(identity):
         else ['--timestamp=none'])
 
 
-def sign(app):
+def app_group_entitlements(team):
+    if not re.fullmatch(r'[A-Z0-9]{10}', team):
+        raise SigningError('App group requires an exact developer team identifier.')
+    # macOS team-prefixed groups are authorized by the signing team; no Keychain
+    # access-group entitlement or broad sandbox exception is added. Do not add
+    # developer.team-identifier: that restricted entitlement requires a profile
+    # on standalone host/engine binaries. TeamIdentifier comes from the signature.
+    return {'com.apple.security.application-groups': [team+'.cd']}
+
+
+def sign_target(target, identifier, identity, app_group_team=None):
+    args = codesign_args(identity) + ['--identifier', identifier]
+    if app_group_team is None:
+        run(args + [str(target)])
+        return
+    if identity == '-':
+        raise SigningError('App group access requires the stable team certificate.')
+    with tempfile.TemporaryDirectory(prefix='clouddrive-group-sign-') as temporary:
+        path = pathlib.Path(temporary)/'entitlements.plist'
+        path.write_bytes(plistlib.dumps(app_group_entitlements(app_group_team)))
+        run(args + ['--entitlements', str(path), str(target)])
+    details = run(['/usr/bin/codesign', '--display', '--verbose=4', str(target)])
+    if 'TeamIdentifier='+app_group_team not in details:
+        raise SigningError('App group and signing certificate teams do not match.')
+
+
+def sign(app, app_group_team=None):
     identity = selection()
     if os.environ.get('CLOUDDRIVE_RELEASE') == '1':
         identities = dict(parse_identities(run(['/usr/bin/security', 'find-identity', '-v', '-p', 'codesigning'])))
@@ -94,7 +120,7 @@ def sign(app):
                 info['rcloneSHA256'] = hashlib.sha256((app/'Contents/Resources/rclone').read_bytes()).hexdigest()
                 manifest.write_text(json.dumps(info, indent=2)+'\n')
         target = app/relative if relative else app
-        run(codesign_args(identity) + ['--identifier', identifier, str(target)])
+        sign_target(target, identifier, identity, app_group_team if not relative else None)
     run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)])
     requirement = designated_requirement(run(['/usr/bin/codesign', '--display', '--requirements', '-', str(app)]))
     signing = {'mode': 'adhoc-preview' if identity == '-' else 'certificate', 'bundleID': APP_ID,
@@ -110,7 +136,7 @@ def sign(app):
             temporary.write_text(json.dumps(signing, indent=2)+'\n'); temporary.chmod(0o600); temporary.replace(BASELINE)
     # This is build metadata, not credential data. Re-sign after adding it to the resource seal.
     (app/'Contents/Resources/SigningInfo.json').write_text(json.dumps(signing, indent=2)+'\n')
-    run(codesign_args(identity) + ['--identifier', APP_ID, str(app)])
+    sign_target(app, APP_ID, identity, app_group_team)
     run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)])
     final = designated_requirement(run(['/usr/bin/codesign', '--display', '--requirements', '-', str(app)]))
     if identity != '-':

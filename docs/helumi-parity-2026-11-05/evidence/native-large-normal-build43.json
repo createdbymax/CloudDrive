@@ -1,0 +1,28 @@
+{
+  "success": true,
+  "phase": "complete",
+  "samples": [
+    {
+      "drive": "Helumi",
+      "finderSeconds": 0.665,
+      "mountedReadbackSHA256": "319b9d0e3343a5a4747368802c2e0f02077d03a14e0a7e795d7fc2f861f66d73"
+    },
+    {
+      "drive": "CloudDrive",
+      "finderSeconds": 7.331,
+      "mountedReadbackSHA256": "319b9d0e3343a5a4747368802c2e0f02077d03a14e0a7e795d7fc2f861f66d73"
+    }
+  ],
+  "build": "43",
+  "engineSHA256": "847f02d52f10fcd8af31b5d1df8831a181e78f7e71ccfd580a02abc1d0d8d4ea",
+  "expectedSHA256": "319b9d0e3343a5a4747368802c2e0f02077d03a14e0a7e795d7fc2f861f66d73",
+  "bytes": 234881024,
+  "availableStateBytes": 307690872832,
+  "stateOnMacSystemDisk": true,
+  "helumiFixtureRemoved": true,
+  "signedPublicationAndUnmountSeconds": 183.39,
+  "r2SHA256": "319b9d0e3343a5a4747368802c2e0f02077d03a14e0a7e795d7fc2f861f66d73",
+  "verifiedSeconds": 189.696,
+  "remainingKeys": 0,
+  "generatedKeysRemoved": 480
+}

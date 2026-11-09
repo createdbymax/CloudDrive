@@ -1,0 +1,262 @@
+--- a/vfs/vfs.go
++++ b/vfs/vfs.go
+@@ -178,19 +178,20 @@
+ 
+ // VFS represents the top level filing system
+ type VFS struct {
+-	f           fs.Fs
+-	ctx         context.Context
+-	root        *Dir
+-	Opt         vfscommon.Options
+-	cache       *vfscache.Cache
+-	cancel      context.CancelFunc
+-	cancelCache context.CancelFunc
+-	usageMu     sync.Mutex
+-	usageTime   time.Time
+-	usage       *fs.Usage
+-	pollMu      sync.Mutex
+-	pollChan    chan time.Duration
+-	inUse       atomic.Int32 // count of number of opens
++	metadataChanges metadataChanges
++	f               fs.Fs
++	ctx             context.Context
++	root            *Dir
++	Opt             vfscommon.Options
++	cache           *vfscache.Cache
++	cancel          context.CancelFunc
++	cancelCache     context.CancelFunc
++	usageMu         sync.Mutex
++	usageTime       time.Time
++	usage           *fs.Usage
++	pollMu          sync.Mutex
++	pollChan        chan time.Duration
++	inUse           atomic.Int32 // count of number of opens
+ }
+ 
+ // Keep track of active VFS keyed on fs.ConfigString(f)
+--- a/vfs/file.go
++++ b/vfs/file.go
+@@ -238,6 +238,8 @@
+ 	newPath := path.Join(destDir.Path(), newCacheName)
+ 
+ 	renameCall := func(ctx context.Context) (err error) {
++		defer d.vfs.noteMetadataChange(oldPath, false)
++		defer d.vfs.noteMetadataChange(newPath, false)
+ 		// chain rename calls if any
+ 		if oldPendingRenameFun != nil {
+ 			err := oldPendingRenameFun(ctx)
+@@ -546,6 +548,9 @@
+ 
+ 	// Release File.mu before calling Dir method
+ 	d.addObject(f)
++	if o != nil {
++		d.vfs.noteMetadataChange(o.Remote(), false)
++	}
+ }
+ 
+ // Update the object but don't update the directory cache - for use by
+@@ -661,6 +666,9 @@
+ 
+ // Remove the file
+ func (f *File) Remove() (err error) {
++	changedPath := f.CachePath()
++	vfs := f.VFS()
++	defer vfs.noteMetadataChange(changedPath, false)
+ 	defer log.Trace(f.Path(), "")("err=%v", &err)
+ 	f.mu.RLock()
+ 	d := f.d
+--- a/vfs/dir.go
++++ b/vfs/dir.go
+@@ -1122,6 +1122,7 @@
+ 
+ // Remove the directory
+ func (d *Dir) Remove() error {
++	defer d.vfs.noteMetadataChange(d.path, true)
+ 	if d.vfs.Opt.ReadOnly {
+ 		return EROFS
+ 	}
+@@ -1213,6 +1214,9 @@
+ 		fs.Errorf(oldPath, "Dir.Rename error: %v", err)
+ 		return err
+ 	}
++	defer d.vfs.noteMetadataChange(oldPath, oldNode.IsDir())
++	defer d.vfs.noteMetadataChange(newPath, oldNode.IsDir())
++
+ 	switch x := oldNode.DirEntry().(type) {
+ 	case nil:
+ 		if oldFile, ok := oldNode.(*File); ok {
+--- /dev/null
++++ b/vfs/metadata_changes.go
+@@ -0,0 +1,106 @@
++package vfs
++
++import (
++	"context"
++	"crypto/rand"
++	"fmt"
++	"sync"
++
++	"github.com/rclone/rclone/fs/rc"
++)
++
++const metadataChangeRetention = 4096
++
++type metadataChange struct {
++	Sequence  uint64 `json:"sequence"`
++	Path      string `json:"path"`
++	Recursive bool   `json:"recursive"`
++}
++
++type metadataChanges struct {
++	mu       sync.Mutex
++	session  string
++	sequence uint64
++	events   []metadataChange
++}
++
++// noteMetadataChange records an invalidation hint, never a claim of publication.
++// Network and disk work must remain outside mutation locks and callbacks.
++func (vfs *VFS) noteMetadataChange(path string, recursive bool) {
++	c := &vfs.metadataChanges
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.session == "" {
++		c.session = rand.Text()
++	}
++	c.sequence++
++	if len(path) > 4096 {
++		path, recursive = "", true
++	}
++	event := metadataChange{c.sequence, path, recursive}
++	if len(c.events) == metadataChangeRetention {
++		copy(c.events, c.events[1:])
++		c.events[len(c.events)-1] = event
++	} else {
++		c.events = append(c.events, event)
++	}
++}
++
++func (vfs *VFS) readMetadataChanges(after uint64, limit int) rc.Params {
++	c := &vfs.metadataChanges
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.session == "" {
++		c.session = rand.Text()
++	}
++	first := c.sequence + 1
++	if len(c.events) > 0 {
++		first = c.events[0].Sequence
++	}
++	events := make([]metadataChange, 0, limit)
++	gap := after > c.sequence || (first > 1 && after < first-1)
++	next := after
++	if gap {
++		next = first - 1
++	}
++	budget := 0
++	for _, event := range c.events {
++		if event.Sequence > next {
++			estimated := len(event.Path)*6 + 128
++			if len(events) > 0 && budget+estimated > 512*1024 {
++				break
++			}
++			budget += estimated
++			events = append(events, event)
++			if len(events) == limit {
++				break
++			}
++		}
++	}
++	if len(events) > 0 {
++		next = events[len(events)-1].Sequence
++	}
++	return rc.Params{"version": 1, "session": c.session, "first": first, "latest": c.sequence,
++		"events": events, "next": next, "hasMore": next < c.sequence, "gap": gap}
++}
++
++func init() {
++	rc.Add(rc.Call{Path: "vfs/metadata-changes", NoAuth: false,
++		Title: "Read bounded metadata invalidation hints.",
++		Help:  "Returns process-local ordered hints. Restart/session changes and retention gaps require reconciliation.",
++		Fn: func(ctx context.Context, in rc.Params) (rc.Params, error) {
++			vfs, err := getVFS(in)
++			if err != nil {
++				return nil, err
++			}
++			after, err := in.GetInt64("after")
++			if err != nil || after < 0 {
++				return nil, fmt.Errorf("after must be a nonnegative integer")
++			}
++			limit, err := in.GetInt64("limit")
++			if err != nil || limit < 1 || limit > 256 {
++				return nil, fmt.Errorf("limit must be between 1 and 256")
++			}
++			return vfs.readMetadataChanges(uint64(after), int(limit)), nil
++		}})
++}
+--- /dev/null
++++ b/vfs/metadata_changes_test.go
+@@ -0,0 +1,63 @@
++package vfs
++
++import (
++	"encoding/json"
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestMetadataChangesRetentionAndSession(t *testing.T) {
++	var v VFS
++	empty := v.readMetadataChanges(0, 10)
++	require.NotEmpty(t, empty["session"])
++	for i := 0; i < metadataChangeRetention+5; i++ {
++		v.noteMetadataChange(fmt.Sprintf("file%d", i), false)
++	}
++	page := v.readMetadataChanges(0, 2)
++	require.Equal(t, true, page["gap"])
++	require.Equal(t, uint64(6), page["first"])
++	events := page["events"].([]metadataChange)
++	require.Len(t, events, 2)
++	require.Equal(t, uint64(6), events[0].Sequence)
++	require.Equal(t, empty["session"], page["session"])
++	last := v.readMetadataChanges(uint64(metadataChangeRetention+5), 10)
++	require.Empty(t, last["events"])
++	require.Equal(t, false, last["hasMore"])
++	var replacement VFS
++	require.NotEqual(t, empty["session"], replacement.readMetadataChanges(0, 1)["session"])
++	require.Equal(t, true, replacement.readMetadataChanges(500, 1)["gap"])
++}
++
++func TestMetadataChangesConcurrentReadersAndWriters(t *testing.T) {
++	var v VFS
++	var group sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		group.Add(1)
++		go func() {
++			defer group.Done()
++			for j := 0; j < 100; j++ {
++				v.noteMetadataChange("same", false)
++				v.readMetadataChanges(0, 256)
++			}
++		}()
++	}
++	group.Wait()
++	require.Equal(t, uint64(800), v.readMetadataChanges(0, 1)["latest"])
++}
++
++func TestMetadataChangesResponseBudget(t *testing.T) {
++	var v VFS
++	for i := 0; i < 256; i++ {
++		v.noteMetadataChange(strings.Repeat("\n", 4096), false)
++	}
++	page := v.readMetadataChanges(0, 256)
++	data, err := json.MarshalIndent(page, "", "\t")
++	require.NoError(t, err)
++	require.Less(t, len(data), 1024*1024)
++	require.Equal(t, true, page["hasMore"])
++	require.NotEmpty(t, page["events"])
++}

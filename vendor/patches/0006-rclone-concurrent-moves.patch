@@ -1,0 +1,2338 @@
+--- a/cmd/serve/nfs/filesystem.go
++++ b/cmd/serve/nfs/filesystem.go
+@@ -86,7 +86,7 @@
+ func (f *FS) Create(filename string) (node billy.File, err error) {
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("%v, err=%v", &node, &err)
+-	release, err := f.vfs.LockMoveMutation()
++	release, err := f.vfs.LockMoveMutationPath(filename)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -119,7 +119,7 @@
+ 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) == 0 {
+ 		return f.vfs.OpenFile(filename, flag, perm)
+ 	}
+-	release, err := f.vfs.LockMoveMutation()
++	release, err := f.vfs.LockMoveMutationPath(filename)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -164,7 +164,7 @@
+ 
+ // Remove deletes a file
+ func (f *FS) Remove(filename string) (err error) {
+-	release, e := f.vfs.LockMoveMutation()
++	release, e := f.vfs.LockMoveMutationPath(f.fullPath(filename))
+ 	if e != nil {
+ 		return e
+ 	}
+@@ -189,7 +189,7 @@
+ // it does not redirect to VFS.MkDirAll because that one doesn't
+ // honor the permissions
+ func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
+-	release, e := f.vfs.LockMoveMutation()
++	release, e := f.vfs.LockMoveMutationPath(f.fullPath(filename))
+ 	if e != nil {
+ 		return e
+ 	}
+@@ -228,7 +228,7 @@
+ 
+ // Symlink creates a link pointing to target
+ func (f *FS) Symlink(target, link string) (err error) {
+-	release, e := f.vfs.LockMoveMutation()
++	release, e := f.vfs.LockMoveMutationPath(f.fullPath(link))
+ 	if e != nil {
+ 		return e
+ 	}
+@@ -248,7 +248,7 @@
+ 
+ // Chmod changes the file modes
+ func (f *FS) Chmod(name string, mode os.FileMode) (err error) {
+-	release, e := f.vfs.LockMoveMutation()
++	release, e := f.vfs.LockMoveMutationPath(f.fullPath(name))
+ 	if e != nil {
+ 		return e
+ 	}
+@@ -271,7 +271,7 @@
+ 
+ // Chown changes owner of the file
+ func (f *FS) Chown(name string, uid, gid int) (err error) {
+-	release, e := f.vfs.LockMoveMutation()
++	release, e := f.vfs.LockMoveMutationPath(f.fullPath(name))
+ 	if e != nil {
+ 		return e
+ 	}
+@@ -288,7 +288,7 @@
+ 
+ // Chtimes changes the access time and modified time
+ func (f *FS) Chtimes(name string, atime time.Time, mtime time.Time) (err error) {
+-	release, e := f.vfs.LockMoveMutation()
++	release, e := f.vfs.LockMoveMutationPath(f.fullPath(name))
+ 	if e != nil {
+ 		return e
+ 	}
+--- a/cmd/serve/nfs/handler.go
++++ b/cmd/serve/nfs/handler.go
+@@ -42,7 +42,7 @@
+ 	}
+ 	vfs.SetMoveNamespaceLocker(func() func() { h.requestMu.Lock(); return h.requestMu.Unlock })
+ 	vfs.SetMoveHandleRenamer(func(oldPath, newPath string) error {
+-		return h.RenameHandles(h.billyFS, strings.Split(oldPath, "/"), strings.Split(newPath, "/"))
++		return h.rewriteMoveHandles(h.billyFS, strings.Split(oldPath, "/"), strings.Split(newPath, "/"))
+ 	})
+ 	var level nfs.LogLevel
+ 	switch {
+@@ -324,9 +324,12 @@
+ 
+ // RenameHandles preserves cached identities after namespace changes.
+ func (h *Handler) RenameHandles(f billy.Filesystem, oldPath, newPath []string) error {
+-	if h.vfs.MoveWasReplay() {
++	if h.vfs.Opt.MoveJournal != "" {
+ 		return nil
+ 	}
++	return h.rewriteMoveHandles(f, oldPath, newPath)
++}
++func (h *Handler) rewriteMoveHandles(f billy.Filesystem, oldPath, newPath []string) error {
+ 	if c, ok := h.Cache.(nfs.RenameHandler); ok {
+ 		return c.RenameHandles(f, oldPath, newPath)
+ 	}
+--- /dev/null
++++ b/vfs/concurrent_moves.go
+@@ -0,0 +1,524 @@
++package vfs
++
++import (
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"os"
++	"path"
++	"path/filepath"
++	"strings"
++	"syscall"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/operations"
++	"github.com/rclone/rclone/fs/rc"
++)
++
++// Fixed slots bound both active provider work and the records scanned at startup.
++// Slot zero preserves the original v1 journal and all completion receipts.
++func (v *VFS) slots() [4]*safeMoveState {
++	return [4]*safeMoveState{&v.safeMoves, &v.moveSlots[0], &v.moveSlots[1], &v.moveSlots[2]}
++}
++func (v *VFS) slotIndex(m *safeMoveState) int {
++	for i, s := range v.slots() {
++		if s == m {
++			return i
++		}
++	}
++	panic("unknown move slot")
++}
++func moveRecordName(slot int) string {
++	if slot == 0 {
++		return "move.json"
++	}
++	return fmt.Sprintf("move-%d.json", slot)
++}
++func newMoveID() (string, error) {
++	var id [16]byte
++	_, err := rand.Read(id[:])
++	return hex.EncodeToString(id[:]), err
++}
++func (v *VFS) normMove(p string) string {
++	ci := fs.GetConfig(v.ctx)
++	return operations.ToNormal(p, !ci.NoUnicodeNormalization, ci.IgnoreCaseSync || v.Opt.CaseInsensitive)
++}
++func (v *VFS) within(p, root string) bool { return moveUnder(v.normMove(p), v.normMove(root)) }
++func intersect(a, b string) bool          { return moveUnder(a, b) || moveUnder(b, a) }
++func (v *VFS) overlaps(s, d, otherS, otherD string) bool {
++	s, d, otherS, otherD = v.normMove(s), v.normMove(d), v.normMove(otherS), v.normMove(otherD)
++	return intersect(s, otherS) || intersect(s, otherD) || intersect(d, otherS) || intersect(d, otherD)
++}
++func (m *safeMoveState) busy() bool { return m.active || (m.native != nil && !m.native.done) }
++func (m *safeMoveState) endpoints() (string, string) {
++	if m.native != nil && !m.native.done {
++		return m.native.source, m.native.destination
++	}
++	if m.journal != nil {
++		return m.journal.Source, m.journal.Destination
++	}
++	if m.native != nil {
++		return m.native.source, m.native.destination
++	}
++	return "", ""
++}
++
++// Native RPC replay and RC submission share admission. No job can reserve a
++// prefix while another is checking its conflict set. Provider work is outside this lock.
++func (v *VFS) admitNative(source, dest, request string, exclusive bool) (string, error) {
++	if !exclusive {
++		source = strings.Trim(source, "/")
++		dest = strings.Trim(dest, "/")
++	}
++	if !movePath(source) || !movePath(dest) || source == dest && exclusive {
++		return "", syscall.EINVAL
++	}
++	v.ensureMoveRegistry()
++	v.moveAdmission.Lock()
++	defer v.moveAdmission.Unlock()
++	return v.admitLocked(source, dest, request, exclusive, false, nil)
++}
++func (v *VFS) admitLocked(source, dest, request string, exclusive, checked bool, preflightErr error) (string, error) {
++	if v.writerConflict(source, dest, exclusive) {
++		return "", syscall.EBUSY
++	}
++	var free, matched *safeMoveState
++	for _, m := range v.slots() {
++		m.mu.Lock()
++		v.loadMoveAt(m)
++		if m.loadError != nil {
++			m.mu.Unlock()
++			return "", syscall.EIO
++		}
++		if exclusive {
++			if n := m.native; n != nil && n.requestID == request {
++				if n.source != source || n.destination != dest {
++					m.mu.Unlock()
++					return "", syscall.EINVAL
++				}
++				id, e := n.id, n.err
++				m.mu.Unlock()
++				return id, e
++			}
++			if j := m.journal; j != nil && j.RequestID == request {
++				if j.Source != source || j.Destination != dest {
++					m.mu.Unlock()
++					return "", syscall.EINVAL
++				}
++				id := j.ID
++				failed := j.Failed
++				m.mu.Unlock()
++				if failed {
++					return "", errMovePreflight
++				}
++				return id, nil
++			}
++		}
++		for _, n := range m.nativeHistory {
++			if exclusive && n.requestID == request && (n.source != source || n.destination != dest) {
++				m.mu.Unlock()
++				return "", syscall.EINVAL
++			}
++			if n.source == source && n.destination == dest && ((request != "" && request == n.requestID) || (!exclusive && n.pathValid && (request != "" || n.epoch == m.epoch))) {
++				m.replayed = true
++				m.mu.Unlock()
++				return n.id, nil
++			}
++		}
++		busy := m.busy()
++		s, d := m.endpoints()
++		if (busy || m.pending) && v.scopesIntersect(source, dest, exclusive, s, d, m.exclusiveJob()) {
++			if busy {
++				m.mu.Unlock()
++				return "", syscall.EBUSY
++			}
++			if m.native != nil && m.native.source == source && m.native.destination == dest && !exclusive {
++				matched = m
++			} else {
++				m.mu.Unlock()
++				return "", syscall.EIO
++			}
++		}
++		if !exclusive && m.journal != nil && m.journal.Complete && m.journal.Source == source && m.journal.Destination == dest && !m.busy() {
++			matched = m
++		}
++		if n := m.native; n != nil && n.done && n.err != nil && n.source == source && n.destination == dest && !exclusive {
++			matched = m
++		}
++		if free == nil && !busy && !m.pending {
++			free = m
++		}
++		m.mu.Unlock()
++	}
++	if matched != nil {
++		free = matched
++	}
++	if free == nil {
++		return "", syscall.EBUSY
++	}
++	if exclusive && !checked {
++		v.moveAdmission.Unlock()
++		err := v.preflightExclusive(source, dest)
++		v.moveAdmission.Lock()
++		// A matching request could have reserved the move during remote checks.
++		return v.admitLocked(source, dest, request, true, true, err)
++	}
++	if preflightErr != nil {
++		return "", preflightErr
++	}
++
++	for _, m := range v.slots() {
++		m.mu.Lock()
++		v.expireMovePaths(m, source)
++		v.expireMovePaths(m, dest)
++		m.mu.Unlock()
++	}
++	err := v.startNative(free, source, dest, request, exclusive)
++	free.mu.Lock()
++	defer free.mu.Unlock()
++	if exclusive && errors.Is(err, syscall.EBUSY) && free.native != nil && free.native.requestID == request {
++		return free.native.id, nil
++	}
++	return "", err
++}
++
++func (v *VFS) LockMoveMutation() (func(), error) {
++	v.ensureMoveRegistry()
++	slots := v.slots()
++	held := 0
++	release := func() {
++		for i := held - 1; i >= 0; i-- {
++			slots[i].gate.RUnlock()
++		}
++	}
++	for _, m := range slots {
++		if !m.gate.TryRLock() {
++			release()
++			return nil, syscall.EBUSY
++		}
++		held++
++		m.mu.Lock()
++		v.loadMoveAt(m)
++		busy, failed := m.busy(), m.pending || m.loadError != nil
++		if !busy && !failed {
++			m.epoch++
++		}
++		m.mu.Unlock()
++		if busy || failed {
++			release()
++			if busy {
++				return nil, syscall.EBUSY
++			}
++			return nil, syscall.EIO
++		}
++	}
++	return release, nil
++}
++
++func (v *VFS) MoveStatus() rc.Params {
++	v.ensureMoveRegistry()
++	slots := v.slots()
++	for _, m := range slots {
++		m.mu.Lock()
++		defer m.mu.Unlock()
++	}
++	jobs := []rc.Params{}
++	selected := -1
++	status := rc.Params{"version": 1, "enabled": v.Opt.MoveJournal != "", "active": false, "needsRecovery": false, "phase": "idle", "completed": 0, "total": 0, "message": ""}
++	for i, m := range slots {
++		v.loadMoveAt(m)
++		if m.native == nil && m.journal == nil && m.loadError == nil && !m.active && m.phase == "" {
++			continue
++		}
++		active := m.busy()
++		recover := !active && (m.pending || m.loadError != nil)
++		phase := m.phase
++		src, dst := m.endpoints()
++		id := fmt.Sprintf("invalid-%d", i)
++		if m.native != nil && (m.busy() || !m.pending) {
++			src, dst = m.native.source, m.native.destination
++			id = m.native.id
++		} else if m.journal != nil {
++			id = m.journal.ID
++		}
++		if m.loadError != nil {
++			src, dst = "", ""
++			id = fmt.Sprintf("invalid-%d", i)
++		}
++		if recover {
++			phase = "needsRecovery"
++		}
++		if active && phase != "preparing" && phase != "copying" && phase != "verifying" && phase != "removing" {
++			phase = "preparing"
++		}
++		j := rc.Params{"id": id, "source": src, "destination": dst, "active": active, "needsRecovery": recover, "phase": phase, "completed": m.completed, "total": m.total, "message": m.problem}
++		if m.journal != nil && m.journal.Failed && id == m.journal.ID {
++			j["failureKind"] = m.journal.FailureKind
++		}
++		jobs = append(jobs, j)
++		priority := 0
++		if phase == "failed" {
++			priority = 1
++		}
++		if recover {
++			priority = 2
++			status["needsRecovery"] = true
++		}
++		if active {
++			priority = 3
++			status["active"] = true
++		}
++		if priority > selected {
++			selected = priority
++			for _, k := range []string{"phase", "completed", "total", "message"} {
++				status[k] = j[k]
++			}
++		}
++	}
++	status["jobs"] = jobs
++	return status
++}
++func (v *VFS) ResumeMove() error { return v.resumeMoveID("") }
++func (v *VFS) resumeMoveID(id string) error {
++	if v.Opt.ReadOnly || v.Opt.MoveJournal == "" {
++		return syscall.EROFS
++	}
++	v.ensureMoveRegistry()
++	v.moveAdmission.Lock()
++	defer v.moveAdmission.Unlock()
++	var candidate *safeMoveState
++	type pair struct {
++		s, d      string
++		exclusive bool
++	}
++	var reserved []pair
++	for _, m := range v.slots() {
++		m.mu.Lock()
++		v.loadMoveAt(m)
++		if m.loadError != nil {
++			m.mu.Unlock()
++			return syscall.EIO
++		}
++		if m.pending || m.busy() {
++			s, d := m.endpoints()
++			for _, p := range reserved {
++				if v.scopesIntersect(s, d, m.exclusiveJob(), p.s, p.d, p.exclusive) {
++					m.mu.Unlock()
++					return fmt.Errorf("overlapping recovery records")
++				}
++			}
++			reserved = append(reserved, pair{s, d, m.exclusiveJob()})
++		}
++		if candidate == nil && m.pending && !m.busy() && m.journal != nil && (id == "" || id == m.journal.ID) {
++			candidate = m
++		}
++		m.mu.Unlock()
++	}
++	if candidate != nil {
++		candidate.mu.Lock()
++		s, d := candidate.endpoints()
++		exclusive := candidate.exclusiveJob()
++		candidate.mu.Unlock()
++		if v.writerConflict(s, d, exclusive) {
++			return syscall.EBUSY
++		}
++	}
++	if candidate == nil {
++		return fmt.Errorf("no matching resumable move")
++	}
++	return v.resumeSlot(candidate)
++}
++func init() {
++	rc.Add(rc.Call{Path: "vfs/move", NoAuth: false, Title: "Submit a non-overwriting native move.", Fn: func(ctx context.Context, in rc.Params) (rc.Params, error) {
++		v, e := getVFS(in)
++		if e != nil {
++			return nil, e
++		}
++		if v.Opt.MoveJournal == "" || v.Opt.ReadOnly {
++			return nil, syscall.EROFS
++		}
++		s, e := in.GetString("source")
++		if e != nil {
++			return nil, e
++		}
++		d, e := in.GetString("destination")
++		if e != nil {
++			return nil, e
++		}
++		request, e := in.GetString("requestID")
++		if e != nil || len(request) < 1 || len(request) > 128 || strings.ContainsAny(request, "/\\\x00") {
++			return nil, syscall.EINVAL
++		}
++		if filepath.IsAbs(s) || filepath.IsAbs(d) || intersect(v.normMove(s), v.normMove(d)) || (!strings.HasPrefix(path.Base(s), "._") && strings.HasPrefix(path.Base(d), "._")) {
++			return nil, syscall.EINVAL
++		}
++		id, e := v.admitNative(s, d, "rc:"+request, true)
++		return moveSubmissionReply(id, e)
++	}})
++}
++func moveSubmissionReply(id string, e error) (rc.Params, error) {
++	if id == "" && errors.Is(e, syscall.EEXIST) {
++		return rc.Params{"accepted": false, "reason": "destinationExists"}, nil
++	}
++	if id == "" && errors.Is(e, syscall.EBUSY) {
++		return rc.Params{"accepted": false, "reason": "busy"}, nil
++	}
++	if e != nil {
++		return nil, e
++	}
++	return rc.Params{"accepted": true, "id": id}, nil
++}
++
++type exclusiveMoveCopier interface {
++	CheckExclusiveMoveCopy(size int64) error
++	CopyExclusiveMove(context.Context, fs.Object, string, string) (fs.Object, error)
++	VerifyExclusiveMove(context.Context, fs.Object, string, string) error
++}
++
++func (v *VFS) writerConflict(s, d string, exclusive bool) bool {
++	for name := range v.moveWriters {
++		if v.scopesIntersect(name, name, false, s, d, exclusive) {
++			return true
++		}
++	}
++	return false
++}
++func (v *VFS) LockMoveMutationPath(name string) (func(), error) {
++	name = strings.Trim(name, "/")
++	if !movePath(name) {
++		return v.LockMoveMutation()
++	}
++	v.ensureMoveRegistry()
++	v.moveAdmission.Lock()
++	defer v.moveAdmission.Unlock()
++	for _, m := range v.slots() {
++		m.mu.Lock()
++		v.loadMoveAt(m)
++		busy := m.busy()
++		pending := m.pending
++		corrupt := m.loadError != nil
++		s, d := m.endpoints()
++		if corrupt || ((busy || pending) && v.scopesIntersect(name, name, false, s, d, m.exclusiveJob())) {
++			m.mu.Unlock()
++			if corrupt || !busy {
++				return nil, syscall.EIO
++			}
++			return nil, syscall.EBUSY
++		}
++		m.epoch++
++		m.mu.Unlock()
++	}
++	if v.moveWriters == nil {
++		v.moveWriters = make(map[string]int)
++	}
++	v.moveWriters[name]++
++	return func() {
++		v.moveAdmission.Lock()
++		defer v.moveAdmission.Unlock()
++		v.moveWriters[name]--
++		if v.moveWriters[name] == 0 {
++			delete(v.moveWriters, name)
++		}
++	}, nil
++}
++
++// Validate the complete record set before any recovered reservation can execute.
++// Slots never share a progress log, request identity, or unfinished endpoint.
++func (v *VFS) ensureMoveRegistry() {
++	v.moveLoadOnce.Do(func() {
++		slots := v.slots()
++		records := make([]*moveJournal, len(slots))
++		bad := map[int]bool{}
++		for i, m := range slots {
++			m.mu.Lock()
++			v.loadMoveAt(m)
++			records[i] = m.journal
++			m.mu.Unlock()
++		}
++		for i, j := range records {
++			if j == nil {
++				continue
++			}
++			for n, k := range records[:i] {
++				if k != nil && ((j.ID != "" && j.ID == k.ID) || (j.RequestID != "" && j.RequestID == k.RequestID) || (!j.Complete && !j.Failed && !k.Complete && !k.Failed && v.scopesIntersect(j.Source, j.Destination, j.Exclusive, k.Source, k.Destination, k.Exclusive))) {
++					bad[i] = true
++					bad[n] = true
++				}
++			}
++		}
++		for i := range bad {
++			m := slots[i]
++			m.mu.Lock()
++			m.loadError = fmt.Errorf("conflicting saved move records")
++			m.problem = "Saved move records conflict. Preserve them for recovery."
++			m.mu.Unlock()
++		}
++	})
++}
++
++var errMovePreflight = errors.New("unsupported or invalid move")
++
++const preflightFailureMessage = "Move could not start. Check file sizes, source and destination, then submit a new move."
++
++func (v *VFS) preflightExclusive(source, dest string) error {
++	a, ok := v.f.(exclusiveMoveCopier)
++	if !ok || v.f.Features().Move != nil || v.f.Features().DirMove != nil {
++		return fmt.Errorf("backend lacks guarded native copy")
++	}
++	if err := a.CheckExclusiveMoveCopy(0); err != nil {
++		return err
++	}
++	if _, err := v.Stat(dest); err == nil {
++		return syscall.EEXIST
++	} else if !errors.Is(err, os.ErrNotExist) {
++		return err
++	}
++	if _, err := v.Stat(source); err != nil {
++		return err
++	}
++	// The VFS cache may be stale. Check the authoritative parent directory too.
++	parent := path.Dir(dest)
++	if parent == "." {
++		parent = ""
++	}
++	return moveRequestError(v.ctx, moveMetadataTimeout, func(ctx context.Context) error {
++		list, err := v.f.List(ctx, parent)
++		if err != nil {
++			return err
++		}
++		for _, entry := range list {
++			_, td, ok := companionPair(source, dest)
++			if v.normMove(entry.Remote()) == v.normMove(dest) || (ok && v.normMove(td) == v.normMove(entry.Remote())) {
++				return syscall.EEXIST
++			}
++		}
++		return nil
++	})
++}
++
++func preflightKind(err error) string {
++	switch {
++	case errors.Is(err, syscall.EEXIST):
++		return "destinationExists"
++	case errors.Is(err, os.ErrNotExist):
++		return "missingPath"
++	case errors.Is(err, errMovePreflight):
++		return "unsupportedPayload"
++	default:
++		return "invalidPath"
++	}
++}
++func preflightMessage(kind string) string {
++	switch kind {
++	case "destinationExists":
++		return "The destination already exists. Choose a different name or folder."
++	case "missingPath":
++		return "The source or its destination folder is missing. Check both paths."
++	case "unsupportedPayload":
++		return "A file exceeds the protected copy limit or its format is unsupported."
++	default:
++		return preflightFailureMessage
++	}
++}
+--- /dev/null
++++ b/vfs/concurrent_moves_test.go
+@@ -0,0 +1,222 @@
++package vfs
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/rc"
++	"github.com/stretchr/testify/require"
++)
++
++func finishJobs(t *testing.T, v *VFS) {
++	t.Helper()
++	require.Eventually(t, func() bool { return v.MoveStatus()["active"] == false }, 5*time.Second, time.Millisecond*5)
++}
++
++func TestNativeMoveConcurrentCopySharedParentAndIndependentRecovery(t *testing.T) {
++	v, f := moveFixture(t)
++	v.Opt.CaseInsensitive = true
++	for _, k := range []string{"Café/a", "Second/b", "Target/keep", "Other/file"} {
++		movePut(t, f, k, k)
++	}
++	copyFn := f.Features().Copy
++	entered := make(chan string, 2)
++	release := make(chan struct{})
++	f.Features().Copy = func(ctx context.Context, o fs.Object, dest string) (fs.Object, error) {
++		entered <- dest
++		select {
++		case <-release:
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++		return nil, errors.New("fixture stopped both copies")
++	}
++	require.ErrorIs(t, v.RenameNativeRequest("Café", "Target/Café", "n1"), syscall.EBUSY)
++	require.Eventually(t, func() bool { return len(entered) == 1 }, 3*time.Second, time.Millisecond*5)
++	require.ErrorIs(t, v.RenameNativeRequest("Second", "Target/Second", "n2"), syscall.EBUSY)
++	require.Eventually(t, func() bool { return len(entered) == 2 }, 3*time.Second, time.Millisecond*5)
++	status := v.MoveStatus()
++	jobs := status["jobs"].([]rc.Params)
++	require.Len(t, jobs, 2)
++	for _, j := range jobs {
++		require.True(t, j["active"].(bool))
++	}
++	for _, p := range []string{"cafe\u0301/a", "TARGET", "target/second/b"} {
++		_, e := v.LockMoveMutationPath(p)
++		require.ErrorIs(t, e, syscall.EBUSY)
++	}
++	lease, e := v.LockMoveMutationPath("Other/new")
++	require.NoError(t, e)
++	require.ErrorIs(t, v.RenameNativeRequest("Other", "Target/Other", "writer"), syscall.EBUSY)
++	lease()
++	require.ErrorIs(t, v.RenameNativeRequest("cafe\u0301", "Else", "n3"), syscall.EBUSY)
++	require.Len(t, v.MoveStatus()["jobs"].([]rc.Params), 2)
++	close(release)
++	finishJobs(t, v)
++	require.FileExists(t, filepath.Join(v.Opt.MoveJournal, "move.json"))
++	require.FileExists(t, filepath.Join(v.Opt.MoveJournal, "move-1.json"))
++	require.Equal(t, true, v.MoveStatus()["needsRecovery"])
++	f.Features().Copy = copyFn
++	fresh := &VFS{ctx: v.ctx, f: f, root: v.root, Opt: v.Opt}
++	require.Error(t, fresh.resumeMoveID("stale"))
++	fresh.Opt.ReadOnly = true
++	require.Error(t, fresh.resumeMoveID(jobs[1]["id"].(string)))
++	fresh.Opt.ReadOnly = false
++	require.NoError(t, fresh.resumeMoveID(jobs[1]["id"].(string)))
++	finishJobs(t, fresh)
++	moveExists(t, f, "Café/a", true)
++	moveExists(t, f, "Second/b", false)
++	moveExists(t, f, "Target/Second/b", true)
++	require.Equal(t, true, fresh.MoveStatus()["needsRecovery"])
++	require.NoError(t, fresh.ResumeMove())
++	finishJobs(t, fresh)
++	moveExists(t, f, "Target/Café/a", true)
++	require.Equal(t, false, fresh.MoveStatus()["needsRecovery"])
++}
++
++// Isolated fake of the provider's exclusive-copy contract.
++type exclusiveFixture struct {
++	fs.Fs
++	mu       sync.Mutex
++	receipts map[string]string
++}
++
++func (f *exclusiveFixture) CheckExclusiveMoveCopy(int64) error { return nil }
++func (f *exclusiveFixture) CopyExclusiveMove(ctx context.Context, src fs.Object, dst, job string) (fs.Object, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if o, e := f.NewObject(ctx, dst); e == nil {
++		if f.receipts[dst] == job {
++			return o, nil
++		}
++		return nil, syscall.EEXIST
++	}
++	o, e := f.Features().Copy(ctx, src, dst)
++	if e == nil {
++		f.receipts[dst] = job
++	}
++	return o, e
++}
++func (f *exclusiveFixture) VerifyExclusiveMove(ctx context.Context, src fs.Object, dst, job string) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.receipts[dst] != job {
++		return syscall.EEXIST
++	}
++	return nil
++}
++func TestNativeMoveDurableExclusiveAdmissionAndRestart(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "A/file", "payload")
++	movePut(t, f, "Target/keep", "keep")
++	v.f = &exclusiveFixture{Fs: f, receipts: map[string]string{}}
++	// Simulate the window immediately after admission fsync, before any planning.
++	v.safeMoves.gate.Lock()
++	id, e := v.admitNative("A", "Target/A", "rc:request", true)
++	require.NoError(t, e)
++	again, e := v.admitNative("A", "Target/A", "rc:request", true)
++	require.NoError(t, e)
++	require.Equal(t, id, again)
++	_, e = v.admitNative("A", "Target/other", "rc:request", true)
++	require.ErrorIs(t, e, syscall.EINVAL)
++	_, e = v.admitNative("Target/keep", "A/file", "rc:conflict", true)
++	require.Error(t, e)
++	// Snapshot crash state to a distinct private directory; never run two workers against one journal.
++	data, e := os.ReadFile(filepath.Join(v.Opt.MoveJournal, "move.json"))
++	require.NoError(t, e)
++	alt := t.TempDir()
++	require.NoError(t, os.Chmod(alt, 0700))
++	require.NoError(t, os.WriteFile(filepath.Join(alt, "move.json"), data, 0600))
++	copyFn := f.Features().Copy
++	f.Features().Copy = func(context.Context, fs.Object, string) (fs.Object, error) { return nil, errors.New("injected") }
++	v.safeMoves.gate.Unlock()
++	finishJobs(t, v)
++	f.Features().Copy = copyFn
++	opt := v.Opt
++	opt.MoveJournal = alt
++	fresh := New(v.ctx, v.f, &opt)
++	t.Cleanup(fresh.Shutdown)
++	require.Equal(t, true, fresh.MoveStatus()["needsRecovery"])
++	repeated, e := fresh.admitNative("A", "Target/A", "rc:request", true)
++	require.NoError(t, e)
++	require.Equal(t, id, repeated)
++	require.NoError(t, fresh.resumeMoveID(id))
++	finishJobs(t, fresh)
++	require.Equal(t, false, fresh.MoveStatus()["needsRecovery"])
++	moveExists(t, f, "A/file", false)
++	moveExists(t, f, "Target/A/file", true)
++}
++
++func TestNativeMoveRefusesConflictingDurableSlots(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "a", "keep")
++	j := &moveJournal{Version: 1, Binding: v.moveBinding(), ID: "000000000000000000000000000000ab", Source: "a", Destination: "b", Objects: []moveObject{{Source: "a", Destination: "b", Size: 4}}}
++	require.NoError(t, v.saveMove(j))
++	j.slot = 1
++	j.Source = "c"
++	j.Destination = "d"
++	j.Objects[0].Source = "c"
++	j.Objects[0].Destination = "d"
++	require.NoError(t, v.saveMove(j))
++	require.Error(t, v.ResumeMove())
++	require.ErrorIs(t, v.CheckMovePath("other"), syscall.EIO)
++	moveExists(t, f, "a", true)
++}
++
++type rejectSizeFixture struct{ *exclusiveFixture }
++
++func (f *rejectSizeFixture) CheckExclusiveMoveCopy(size int64) error {
++	if size > 0 {
++		return errors.New("fixture rejects positive payloads")
++	}
++	return nil
++}
++func TestNativeMoveTerminalPreparationFailureReleasesSlot(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "A/a", "unchanged")
++	movePut(t, f, "Target/keep", "keep")
++	v.f = &rejectSizeFixture{&exclusiveFixture{Fs: f, receipts: map[string]string{}}}
++	id, e := v.admitNative("A", "Target/A", "rc:large", true)
++	require.NoError(t, e)
++	finishJobs(t, v)
++	status := v.MoveStatus()
++	require.Equal(t, "failed", status["phase"])
++	require.Equal(t, false, status["needsRecovery"])
++	require.Error(t, v.resumeMoveID(id))
++	moveExists(t, f, "A/a", true)
++	moveExists(t, f, "Target/A/a", false)
++	fresh := &VFS{ctx: v.ctx, f: v.f, root: v.root, Opt: v.Opt}
++	require.Equal(t, "failed", fresh.MoveStatus()["phase"])
++	require.Equal(t, false, fresh.MoveStatus()["needsRecovery"])
++	_, e = fresh.admitNative("A", "Target/A", "rc:large", true)
++	require.Error(t, e)
++	lease, e := fresh.LockMoveMutationPath("A/a")
++	require.NoError(t, e)
++	lease()
++	// Fresh submission succeeds in the released slot with the now-supported backend.
++	v.f = &exclusiveFixture{Fs: f, receipts: map[string]string{}}
++	next, e := v.admitNative("A", "Target/A", "rc:new", true)
++	require.NoError(t, e)
++	require.NotEqual(t, id, next)
++	finishJobs(t, v)
++	moveExists(t, f, "Target/A/a", true)
++}
++
++func TestNativeMoveSubmissionRefusal(t *testing.T) {
++	for err, reason := range map[error]string{syscall.EEXIST: "destinationExists", syscall.EBUSY: "busy"} {
++		reply, e := moveSubmissionReply("", err)
++		require.NoError(t, e)
++		require.Equal(t, rc.Params{"accepted": false, "reason": reason}, reply)
++	}
++	_, e := moveSubmissionReply("previous-job", syscall.EEXIST)
++	require.ErrorIs(t, e, syscall.EEXIST)
++	_, e = moveSubmissionReply("", syscall.EIO)
++	require.ErrorIs(t, e, syscall.EIO)
++}
+--- a/vfs/dir.go
++++ b/vfs/dir.go
+@@ -77,8 +77,10 @@
+ 
+ func (d *Dir) cacheCleanup() {
+ 	if d.vfs.Opt.MoveJournal != "" {
+-		d.vfs.safeMoves.gate.RLock()
+-		defer d.vfs.safeMoves.gate.RUnlock()
++		for _, m := range d.vfs.slots() {
++			m.gate.RLock()
++			defer m.gate.RUnlock()
++		}
+ 	}
+ 	defer func() {
+ 		// We should never panic here
+@@ -1239,6 +1241,9 @@
+ //
+ // It returns EINVAL if newName isn't a single safe path element.
+ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
++	return d.renameWithSlot(oldName, newName, destDir, &d.vfs.safeMoves)
++}
++func (d *Dir) renameWithSlot(oldName, newName string, destDir *Dir, m *safeMoveState) error {
+ 	// fs.Debugf(d, "BEFORE\n%s", d.dump())
+ 	if d.vfs.Opt.ReadOnly {
+ 		return EROFS
+@@ -1260,7 +1265,7 @@
+ 	switch x := oldNode.DirEntry().(type) {
+ 	case nil:
+ 		if oldFile, ok := oldNode.(*File); ok {
+-			if err = oldFile.rename(d.vfs.ctx, destDir, newName); err != nil {
++			if err = oldFile.renameWithSlot(d.vfs.ctx, destDir, newName, m); err != nil {
+ 				fs.Errorf(oldPath, "Dir.Rename error: %v", err)
+ 				return err
+ 			}
+@@ -1270,7 +1275,7 @@
+ 		}
+ 	case fs.Object:
+ 		if oldFile, ok := oldNode.(*File); ok {
+-			if err = oldFile.rename(d.vfs.ctx, destDir, newName); err != nil {
++			if err = oldFile.renameWithSlot(d.vfs.ctx, destDir, newName, m); err != nil {
+ 				fs.Errorf(oldPath, "Dir.Rename error: %v", err)
+ 				return err
+ 			}
+@@ -1289,7 +1294,7 @@
+ 		srcRemote := x.Remote()
+ 		dstRemote := newPath
+ 		if d.vfs.Opt.MoveJournal != "" && features.DirMove == nil && features.Move == nil && features.Copy != nil {
+-			_, err = d.vfs.journalRemoteMove(d.vfs.ctx, srcRemote, dstRemote, true)
++			_, err = d.vfs.journalRemoteMoveAt(m, d.vfs.ctx, srcRemote, dstRemote, true)
+ 		} else {
+ 			err = operations.DirMove(d.vfs.ctx, d.f, srcRemote, dstRemote)
+ 		}
+@@ -1308,7 +1313,7 @@
+ 					}
+ 				}
+ 				if d.vfs.Opt.MoveJournal != "" {
+-					d.vfs.beginMoveCommit()
++					m.beginMoveCommit()
+ 				}
+ 				oldDir.rename(destDir, newDir)
+ 			}
+--- a/vfs/file.go
++++ b/vfs/file.go
+@@ -221,6 +221,9 @@
+ // Otherwise it will queue the rename operation on the remote until no writers
+ // remain.
+ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
++	return f.renameWithSlot(ctx, destDir, newName, &destDir.vfs.safeMoves)
++}
++func (f *File) renameWithSlot(ctx context.Context, destDir *Dir, newName string, m *safeMoveState) error {
+ 	f.mu.RLock()
+ 	d := f.d
+ 	oldPendingRenameFun := f.pendingRenameFun
+@@ -264,7 +267,7 @@
+ 			// do the move of the remote object
+ 			var dstOverwritten fs.Object
+ 			if d.vfs.Opt.MoveJournal != "" && d.Fs().Features().Move == nil && d.Fs().Features().Copy != nil {
+-				newObject, err = d.vfs.journalRemoteMove(ctx, o.Remote(), newPath, false)
++				newObject, err = d.vfs.journalRemoteMoveAt(m, ctx, o.Remote(), newPath, false)
+ 			} else {
+ 				dstOverwritten, _ = d.Fs().NewObject(ctx, newPath)
+ 				newObject, err = operations.Move(ctx, d.Fs(), dstOverwritten, newPath, o)
+@@ -283,7 +286,7 @@
+ 		}
+ 		// Commit native-visible fields only after remote work finishes.
+ 		if d.vfs.Opt.MoveJournal != "" {
+-			d.vfs.beginMoveCommit()
++			m.beginMoveCommit()
+ 			dPath := destDir.Path()
+ 			f.mu.Lock()
+ 			f.d = destDir
+--- /dev/null
++++ b/vfs/move_companion.go
+@@ -0,0 +1,218 @@
++package vfs
++
++import (
++	"context"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"path"
++	"sort"
++	"strings"
++	"syscall"
++
++	"github.com/rclone/rclone/fs"
++)
++
++func companionPair(src, dst string) (string, string, bool) {
++	if strings.HasPrefix(path.Base(src), "._") || strings.HasPrefix(path.Base(dst), "._") {
++		return "", "", false
++	}
++	return path.Join(path.Dir(src), "._"+path.Base(src)), path.Join(path.Dir(dst), "._"+path.Base(dst)), true
++}
++
++// Reserve both potential sidecar paths before reading inventory. Finder may
++// create metadata while a folder is being prepared; an unrelated path stays writable.
++func moveEndpoints(src, dst string, exclusive bool) []string {
++	endpoints := []string{src, dst}
++	if a, b, ok := companionPair(src, dst); ok && exclusive {
++		return append(endpoints, a, b)
++	}
++	return endpoints
++}
++func (m *safeMoveState) exclusiveJob() bool {
++	if n := m.native; n != nil && !n.done {
++		return n.exclusive
++	}
++	return m.journal != nil && m.journal.Exclusive
++}
++func (v *VFS) scopesIntersect(src, dst string, exclusive bool, s, d string, otherExclusive bool) bool {
++	for _, left := range moveEndpoints(src, dst, exclusive) {
++		for _, right := range moveEndpoints(s, d, otherExclusive) {
++			if intersect(v.normMove(left), v.normMove(right)) {
++				return true
++			}
++		}
++	}
++	return false
++}
++func (v *VFS) inMoveScope(name, src, dst string, exclusive bool) bool {
++	for _, root := range moveEndpoints(src, dst, exclusive) {
++		if v.within(name, root) {
++			return true
++		}
++	}
++	return false
++}
++
++const appleDoubleHeader = 26
++const maxAppleDoubleEntries = 256
++
++func validAppleDoubleHeader(data []byte, size int64) bool {
++	if len(data) < appleDoubleHeader || binary.BigEndian.Uint32(data) != 0x00051607 || binary.BigEndian.Uint32(data[4:]) != 0x00020000 {
++		return false
++	}
++	n := int(binary.BigEndian.Uint16(data[24:]))
++	table := appleDoubleHeader + 12*n
++	if n < 1 || n > maxAppleDoubleEntries || len(data) < table {
++		return false
++	}
++	ids := make(map[uint32]bool, n)
++	type extent struct{ start, end int64 }
++	var spans []extent
++	for i := 0; i < n; i++ {
++		entry := data[appleDoubleHeader+12*i:]
++		id := binary.BigEndian.Uint32(entry)
++		start := int64(binary.BigEndian.Uint32(entry[4:]))
++		end := start + int64(binary.BigEndian.Uint32(entry[8:]))
++		if id == 0 || ids[id] || start < int64(table) || end > size {
++			return false
++		}
++		ids[id] = true
++		if end > start {
++			spans = append(spans, extent{start, end})
++		}
++	}
++	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
++	for i := 1; i < len(spans); i++ {
++		if spans[i].start < spans[i-1].end {
++			return false
++		}
++	}
++	return true
++}
++func isAppleDouble(ctx context.Context, o fs.Object) (bool, error) {
++	size := o.Size()
++	if size < 0 {
++		return false, fmt.Errorf("unknown sidecar size")
++	}
++	if size < appleDoubleHeader {
++		return false, nil
++	}
++	n := min(size, int64(appleDoubleHeader+12*maxAppleDoubleEntries))
++	r, e := o.Open(ctx, &fs.RangeOption{Start: 0, End: n - 1})
++	if e != nil {
++		return false, e
++	}
++	data := make([]byte, n)
++	_, e = io.ReadFull(r, data)
++	closeErr := r.Close()
++	if e != nil {
++		return false, e
++	}
++	if closeErr != nil {
++		return false, closeErr
++	}
++	return validAppleDoubleHeader(data, size), nil
++}
++func (v *VFS) inventoryCompanion(ctx context.Context, j *moveJournal) error {
++	s, d, ok := companionPair(j.Source, j.Destination)
++	if !j.Exclusive || !ok {
++		return nil
++	}
++	return moveRequestError(ctx, moveMetadataTimeout, func(ctx context.Context) error {
++		// Recheck after submission, including when replaying a preparation intent.
++		if _, e := v.f.NewObject(ctx, d); e == nil || errors.Is(e, fs.ErrorIsDir) {
++			return syscall.EEXIST
++		} else if !errors.Is(e, fs.ErrorObjectNotFound) {
++			return e
++		}
++		o, e := v.f.NewObject(ctx, s)
++		if errors.Is(e, fs.ErrorObjectNotFound) || errors.Is(e, fs.ErrorIsDir) {
++			return nil
++		}
++		if e != nil {
++			return e
++		}
++		valid, e := isAppleDouble(ctx, o)
++		if e != nil || !valid {
++			return e
++		}
++		if len(j.Objects) >= moveObjectLimit {
++			return fmt.Errorf("too many objects in move")
++		}
++		j.AppleDouble = true
++		j.Objects = append(j.Objects, moveObject{Source: s, Destination: d})
++		return nil
++	})
++}
++func (j *moveJournal) isCompanion(r moveObject) bool {
++	s, d, ok := companionPair(j.Source, j.Destination)
++	return j.Exclusive && j.AppleDouble && ok && r.Source == s && r.Destination == d
++}
++
++// Invalidate the two parent listings even if no sidecar was present. A
++// provider-side RC move does not have a Finder RENAME reply to update listings.
++func (v *VFS) publishMoveCache(j *moveJournal, m *safeMoveState) error {
++	if !j.Exclusive {
++		return nil
++	}
++	if j.AppleDouble {
++		s, d, ok := companionPair(j.Source, j.Destination)
++		if !ok {
++			return fmt.Errorf("invalid sidecar paths")
++		}
++		if e := publishHandleRename(m, &j.companionHandlesPublished, s, d); e != nil {
++			return e
++		}
++		v.noteMetadataChange(s, false)
++		v.noteMetadataChange(d, false)
++	}
++	for _, key := range moveEndpoints(j.Source, j.Destination, true) {
++		v.root.ForgetPath(key, fs.EntryObject)
++	}
++	return nil
++}
++
++func publishHandleRename(m *safeMoveState, published *bool, source, dest string) error {
++	if *published || m.onResume == nil {
++		return nil
++	}
++	if err := m.onResume(source, dest); err != nil {
++		return err
++	}
++	*published = true
++	return nil
++}
++
++// Perform provider reads and cache file I/O before the NFS namespace commit.
++// Recheck the receipt even if this is a resume after all deletes were synced.
++func (v *VFS) prepareCompanionCache(ctx context.Context, j *moveJournal) error {
++	if !j.AppleDouble {
++		return nil
++	}
++	for i := range j.Objects {
++		r := &j.Objects[i]
++		if !j.isCompanion(*r) {
++			continue
++		}
++		obj, err := moveRequest(ctx, moveMetadataTimeout, func(ctx context.Context) (fs.Object, error) {
++			dst, err := v.f.NewObject(ctx, r.Destination)
++			if err != nil {
++				return nil, err
++			}
++			if !v.destinationMatches(ctx, dst, r) {
++				return nil, fmt.Errorf("destination sidecar changed before cache publication")
++			}
++			return dst, nil
++		})
++		if err != nil {
++			return err
++		}
++		if v.cache != nil && v.cache.Exists(r.Source) {
++			return v.cache.Rename(r.Source, r.Destination, obj)
++		}
++		return nil
++	}
++	return fmt.Errorf("missing sidecar receipt")
++}
+--- /dev/null
++++ b/vfs/move_companion_test.go
+@@ -0,0 +1,242 @@
++package vfs
++
++import (
++	"context"
++	"encoding/binary"
++	"errors"
++	"os"
++	"path/filepath"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/stretchr/testify/require"
++)
++
++func sidecarBytes() string {
++	b := make([]byte, 45)
++	binary.BigEndian.PutUint32(b, 0x51607)
++	binary.BigEndian.PutUint32(b[4:], 0x20000)
++	binary.BigEndian.PutUint16(b[24:], 1)
++	binary.BigEndian.PutUint32(b[26:], 2)
++	binary.BigEndian.PutUint32(b[30:], 38)
++	binary.BigEndian.PutUint32(b[34:], 7)
++	copy(b[38:], "uniquef")
++	return string(b)
++}
++func TestNativeMoveAppleDouble(t *testing.T) {
++	for _, folder := range []bool{true, false} {
++		for _, valid := range []bool{true, false} {
++			v, f := moveFixture(t)
++			key := "Primary"
++			end := "Target/Renamed"
++			if folder {
++				key += "/data"
++				end += "/data"
++			}
++			movePut(t, f, key, "user bytes")
++			movePut(t, f, "Target/keep", "old")
++			side := sidecarBytes()
++			if !valid {
++				side = "ordinary existing sibling, preserve in its original directory"
++			}
++			movePut(t, f, "._Primary", side)
++			// Prime positive and negative entries in both VFS directory caches.
++			_, e := v.Stat("._Primary")
++			require.NoError(t, e)
++			_, e = v.Stat("Target/._Renamed")
++			require.ErrorIs(t, e, os.ErrNotExist)
++			v.f = &exclusiveFixture{Fs: f, receipts: map[string]string{}}
++			_, e = v.admitNative("Primary", "Target/Renamed", "rc:side", true)
++			require.NoError(t, e)
++			finishJobs(t, v)
++			require.Equal(t, "completed", v.MoveStatus()["phase"])
++			moveExists(t, f, key, false)
++			moveExists(t, f, end, true)
++			moveExists(t, f, "._Primary", !valid)
++			moveExists(t, f, "Target/._Renamed", valid)
++			_, e = v.Stat("Target/._Renamed")
++			if valid {
++				require.NoError(t, e)
++				_, e = v.Stat("._Primary")
++				require.ErrorIs(t, e, os.ErrNotExist)
++			} else {
++				require.ErrorIs(t, e, os.ErrNotExist)
++			}
++		}
++	}
++}
++func TestNativeMoveAppleDoubleGuardAndRecovery(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "Primary/data", "user bytes")
++	movePut(t, f, "Target/keep", "old")
++	movePut(t, f, "._Primary", sidecarBytes())
++	movePut(t, f, "Target/._Renamed", "prior target")
++	v.f = &exclusiveFixture{Fs: f, receipts: map[string]string{}}
++	_, e := v.admitNative("Primary", "Target/Renamed", "rc:collision", true)
++	require.ErrorIs(t, e, syscall.EEXIST)
++	moveExists(t, f, "Primary/data", true)
++	moveExists(t, f, "._Primary", true)
++	dst, e := f.NewObject(v.ctx, "Target/._Renamed")
++	require.NoError(t, e)
++	require.NoError(t, dst.Remove(v.ctx))
++	releaseWriter, e := v.LockMoveMutationPath("._Primary")
++	require.NoError(t, e)
++	_, e = v.admitNative("Primary", "Target/Renamed", "rc:busy", true)
++	require.ErrorIs(t, e, syscall.EBUSY)
++	releaseWriter()
++	blocked, proceed := make(chan struct{}), make(chan struct{})
++	copyFn := f.Features().Copy
++	f.Features().Copy = func(ctx context.Context, o fs.Object, dst string) (fs.Object, error) {
++		if dst == "Target/._Renamed" {
++			close(blocked)
++			<-proceed
++			return nil, errors.New("fixture interruption")
++		}
++		return copyFn(ctx, o, dst)
++	}
++	id, e := v.admitNative("Primary", "Target/Renamed", "rc:metadata", true)
++	require.NoError(t, e)
++	select {
++	case <-blocked:
++	case <-time.After(2 * time.Second):
++		t.Fatal("companion copy was not reached")
++	}
++	for _, k := range []string{"._Primary", "Target/._Renamed"} {
++		_, e := v.LockMoveMutationPath(k)
++		require.ErrorIs(t, e, syscall.EBUSY)
++		require.ErrorIs(t, v.CheckMovePath(k), syscall.EBUSY)
++		_, e = v.admitNative(k, "Other", "rc:other", true)
++		require.ErrorIs(t, e, syscall.EBUSY)
++	}
++	close(proceed)
++	finishJobs(t, v)
++	require.Equal(t, true, v.MoveStatus()["needsRecovery"])
++	moveExists(t, f, "Primary/data", true)
++	moveExists(t, f, "._Primary", true)
++	f.Features().Copy = copyFn
++	fresh := &VFS{ctx: v.ctx, f: v.f, root: v.root, Opt: v.Opt}
++	require.NoError(t, fresh.resumeMoveID(id))
++	finishJobs(t, fresh)
++	require.Equal(t, false, fresh.MoveStatus()["needsRecovery"])
++	moveExists(t, f, "._Primary", false)
++	moveExists(t, f, "Target/._Renamed", true)
++	moveExists(t, f, "Target/Renamed/data", true)
++}
++func TestNativeMoveAppleDoubleDoesNotRecurseOrTrustForeignJournal(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "._Primary", sidecarBytes())
++	movePut(t, f, "._._Primary", sidecarBytes())
++	movePut(t, f, "Target/keep", "old")
++	v.f = &exclusiveFixture{Fs: f, receipts: map[string]string{}}
++	_, e := v.admitNative("._Primary", "Target/._Primary", "rc:literal", true)
++	require.NoError(t, e)
++	finishJobs(t, v)
++	moveExists(t, f, "._._Primary", true)
++	moveExists(t, f, "Target/._._Primary", false)
++	j := &moveJournal{ID: "000000000000000000000000000000a0", Binding: v.moveBinding(), Version: 1, Source: "A", Destination: "Target/A", Exclusive: true, RequestID: "rc:test", AppleDouble: true, Objects: []moveObject{{Source: "._A", Destination: "Target/._B"}}}
++	require.NoError(t, v.saveMove(j))
++	fresh := &VFS{ctx: v.ctx, f: v.f, root: v.root, Opt: v.Opt}
++	require.Equal(t, true, fresh.MoveStatus()["needsRecovery"])
++	require.Error(t, fresh.ResumeMove())
++	require.FileExists(t, filepath.Join(v.Opt.MoveJournal, "move.json"))
++}
++
++type blockedPublicationFS struct {
++	*exclusiveFixture
++	entered chan struct{}
++	release chan struct{}
++	once    sync.Once
++}
++
++func (f *blockedPublicationFS) NewObject(ctx context.Context, key string) (fs.Object, error) {
++	if key == "Target/._Renamed" {
++		_, sourceErr := f.Fs.NewObject(ctx, "Primary")
++		_, sideErr := f.Fs.NewObject(ctx, "._Primary")
++		if errors.Is(sourceErr, fs.ErrorObjectNotFound) && errors.Is(sideErr, fs.ErrorObjectNotFound) {
++			if _, ok := ctx.Deadline(); !ok {
++				return nil, errors.New("unbounded post-delete sidecar lookup")
++			}
++			f.once.Do(func() { close(f.entered) })
++			select {
++			case <-ctx.Done():
++				return nil, ctx.Err()
++			case <-f.release:
++			}
++		}
++	}
++	return f.Fs.NewObject(ctx, key)
++}
++
++func TestNativeMoveCompanionPublicationAllowsBrowsingAndResumesHandlesOnce(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "Primary", "main")
++	movePut(t, f, "._Primary", sidecarBytes())
++	movePut(t, f, "Target/keep", "original")
++	remote := &blockedPublicationFS{exclusiveFixture: &exclusiveFixture{Fs: f, receipts: map[string]string{}}, entered: make(chan struct{}), release: make(chan struct{})}
++	v.f = remote
++	var namespace sync.Mutex
++	v.SetMoveNamespaceLocker(func() func() { namespace.Lock(); return namespace.Unlock })
++	calls := map[string]int{}
++	record := filepath.Join(v.Opt.MoveJournal, "move.json")
++	v.SetMoveHandleRenamer(func(s, d string) error {
++		calls[s]++
++		if s == "._Primary" && calls[s] == 1 {
++			if err := os.Rename(record, record+".saved"); err != nil {
++				return err
++			}
++			return os.Mkdir(record, 0700) // Force the following atomic journal replacement to fail.
++		}
++		return nil
++	})
++	id, e := v.admitNative("Primary", "Target/Renamed", "rc:publish", true)
++	require.NoError(t, e)
++	select {
++	case <-remote.entered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("did not reach bounded post-delete lookup")
++	}
++	available := namespace.TryLock()
++	if available {
++		namespace.Unlock()
++	}
++	close(remote.release)
++	require.True(t, available, "unrelated Finder requests must proceed while provider lookup is blocked")
++	finishJobs(t, v)
++	require.Equal(t, true, v.MoveStatus()["needsRecovery"])
++	require.Equal(t, map[string]int{"Primary": 1, "._Primary": 1}, calls)
++	require.NoError(t, os.Remove(record))
++	require.NoError(t, os.Rename(record+".saved", record))
++	require.NoError(t, v.resumeMoveID(id))
++	finishJobs(t, v)
++	require.Equal(t, false, v.MoveStatus()["needsRecovery"])
++	require.Equal(t, map[string]int{"Primary": 1, "._Primary": 1}, calls)
++	moveExists(t, f, "Target/Renamed", true)
++	moveExists(t, f, "Target/._Renamed", true)
++}
++func TestNativeMoveRecoveryRejectsFileWithoutPrimary(t *testing.T) {
++	for _, bad := range []string{"sidecar-only", "empty", "directories"} {
++		t.Run(bad, func(t *testing.T) {
++			v, f := moveFixture(t)
++			movePut(t, f, "A", "keep")
++			movePut(t, f, "._A", sidecarBytes())
++			j := &moveJournal{Version: 1, ID: "000000000000000000000000000000ac", Binding: v.moveBinding(), Source: "A", Destination: "Target/A", RequestID: "rc:test", Exclusive: true}
++			if bad == "sidecar-only" {
++				j.AppleDouble = true
++				j.Objects = []moveObject{{Source: "._A", Destination: "Target/._A", Size: int64(len(sidecarBytes()))}}
++			}
++			if bad == "directories" {
++				j.Objects = []moveObject{{Source: "A", Destination: "Target/A", Size: 4}}
++				j.Directories = []string{"A/child"}
++			}
++			require.NoError(t, v.saveMove(j))
++			fresh := &VFS{ctx: v.ctx, f: f, root: v.root, Opt: v.Opt}
++			require.Error(t, fresh.ResumeMove())
++			require.Equal(t, true, fresh.MoveStatus()["needsRecovery"])
++			moveExists(t, f, "A", true)
++			moveExists(t, f, "._A", true)
++		})
++	}
++}
+--- a/vfs/move_requests.go
++++ b/vfs/move_requests.go
+@@ -85,9 +85,9 @@
+ 	completed int
+ }
+ 
+-func (r *moveReceipts) advance(vfs *VFS, phase string, total int) {
++func (r *moveReceipts) advance(m *safeMoveState, phase string, total int) {
+ 	r.completed++
+-	vfs.movePhase(phase, r.completed, total)
++	m.movePhase(phase, r.completed, total)
+ }
+ 
+ // moveCopyProof records identity observed on the newly copied destination.
+--- a/vfs/native_moves.go
++++ b/vfs/native_moves.go
+@@ -2,11 +2,14 @@
+ 
+ import (
+ 	"errors"
++	"os"
+ 	"strings"
+ 	"syscall"
+ )
+ 
+ type nativeMove struct {
++	id                  string
++	exclusive           bool
+ 	source, destination string
+ 	requestID           string
+ 	pathValid           bool
+@@ -30,30 +33,19 @@
+ 	if vfs.Opt.MoveJournal == "" {
+ 		return vfs.Rename(source, destination)
+ 	}
+-	source = strings.Trim(source, "/")
+-	destination = strings.Trim(destination, "/")
+-	if !movePath(source) || !movePath(destination) {
+-		return syscall.EINVAL
+-	}
+-	m := &vfs.safeMoves
++	_, err := vfs.admitNative(source, destination, requestID, false)
++	return err
++}
++
++func (vfs *VFS) startNative(m *safeMoveState, source, destination, requestID string, exclusive bool) error {
+ 	m.mu.Lock()
+-	vfs.loadMove()
+-	for i := len(m.nativeHistory) - 1; i >= 0; i-- {
+-		job := m.nativeHistory[i]
+-		if job.source == source && job.destination == destination &&
+-			((requestID != "" && job.requestID == requestID) ||
+-				(job.pathValid && (requestID != "" || job.epoch == m.epoch))) {
+-			m.replayed = true
+-			m.mu.Unlock()
+-			return nil
+-		}
+-	}
++	vfs.loadMoveAt(m)
+ 	if job := m.native; job != nil {
+ 		if !job.done {
+ 			m.mu.Unlock()
+ 			return syscall.EBUSY
+ 		}
+-		if job.source == source && job.destination == destination && job.err != nil {
++		if !exclusive && job.source == source && job.destination == destination && job.err != nil {
+ 			// Finder may change XID when retrying JUKEBOX. Deliver this job's
+ 			// terminal error before treating a later call as a fresh attempt.
+ 			// Retained journal failures remain blocked until explicit recovery.
+@@ -72,43 +64,68 @@
+ 		m.mu.Unlock()
+ 		return syscall.EIO
+ 	}
+-	// A new rename may recreate a previous source.
+-	// Retain RPC-specific results, but expire ambiguous path-only outcomes.
+-	for i := range m.nativeHistory {
+-		old := &m.nativeHistory[i]
+-		if moveUnder(source, old.source) || moveUnder(old.source, source) ||
+-			moveUnder(destination, old.source) || moveUnder(old.source, destination) {
+-			old.pathValid = false
+-		}
+-	}
+-	job := &nativeMove{source: source, destination: destination, requestID: requestID}
++	id, err := newMoveID()
++	if err != nil {
++		m.mu.Unlock()
++		return err
++	}
++	job := &nativeMove{id: id, exclusive: exclusive, source: source, destination: destination, requestID: requestID}
++	if exclusive {
++		j := &moveJournal{ID: id, Version: 1, Binding: vfs.moveBinding(), Source: source, Destination: destination, Exclusive: true, Preparing: true, RequestID: requestID, slot: vfs.slotIndex(m)}
++		if err := vfs.saveMove(j); err != nil {
++			m.journal = j
++			m.pending = true
++			m.phase = "needsRecovery"
++			m.problem = "Move admission needs recovery."
++			m.mu.Unlock()
++			return err
++		}
++		m.journal = j
++		m.pending = true
++	}
+ 	m.native = job
+ 	m.phase = "preparing"
+ 	m.completed = 0
+ 	m.total = 0
+ 	m.problem = ""
+ 	m.mu.Unlock()
+-	go func() {
+-		err := vfs.Rename(source, destination)
+-		m.mu.Lock()
+-		defer m.mu.Unlock()
+-		job.done = true
+-		job.err = err
+-		job.epoch = m.epoch
+-		if err != nil && !m.pending {
+-			m.phase = "failed"
+-			if m.problem == "" {
+-				m.problem = "Move could not finish. Check storage access and try again."
+-			}
+-			if err == syscall.EBUSY {
+-				m.problem = "Close open files or wait for uploads to finish, then try the move again."
+-			}
+-		}
+-		if err == nil {
+-			m.rememberNativeMove(job)
+-		}
+-	}()
++	go vfs.executeNative(m, job)
+ 	return syscall.EBUSY
++}
++func (vfs *VFS) executeNative(m *safeMoveState, job *nativeMove) {
++	err := vfs.safeRenameAt(m, job.source, job.destination)
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	m.active = false
++	// Only a preparation intent can be retired: publication of a full inventory
++	// precedes every provider mutation, including creation of destination directories.
++	j := m.journal
++	if err != nil && j != nil && j.Preparing && j.ID == job.id && (errors.Is(err, errMovePreflight) || errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.EEXIST) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EINVAL)) {
++		terminal := *j
++		terminal.Preparing = false
++		terminal.Failed = true
++		terminal.FailureKind = preflightKind(err)
++		if saveErr := vfs.saveMove(&terminal); saveErr == nil {
++			m.journal = &terminal
++			m.pending = false
++			m.problem = preflightMessage(terminal.FailureKind)
++		}
++	}
++	job.done = true
++	job.err = err
++	job.epoch = m.epoch
++	if err != nil && !m.pending {
++		m.phase = "failed"
++		if m.problem == "" {
++			m.problem = "Move could not finish. Check storage access and try again."
++		}
++		if err == syscall.EBUSY {
++			m.problem = "Close open files or wait for uploads to finish, then try the move again."
++		}
++	}
++	if err == nil {
++		m.rememberNativeMove(job)
++	}
+ }
+ 
+ // rememberNativeMove is called with m.mu held after durable completion.
+@@ -126,34 +143,46 @@
+ // transaction-specific results remain available for actual retransmissions.
+ func (vfs *VFS) NotifyMoveCreation(name string) {
+ 	name = strings.Trim(name, "/")
+-	m := &vfs.safeMoves
++	for _, m := range vfs.slots() {
++		m.mu.Lock()
++		vfs.expireMovePaths(m, name)
++		m.mu.Unlock()
++	}
++}
++func (vfs *VFS) expireMovePaths(m *safeMoveState, name string) {
++	for i := range m.nativeHistory {
++		job := &m.nativeHistory[i]
++		if vfs.within(name, job.source) || vfs.within(job.source, name) {
++			job.pathValid = false
++		}
++	}
++}
++
++// CheckMovePath keeps affected native objects retryable without stalling unrelated browsing.
++func (vfs *VFS) CheckMovePath(name string) error {
++	vfs.ensureMoveRegistry()
++	name = strings.Trim(name, "/")
++	for _, m := range vfs.slots() {
++		if err := vfs.checkMoveSlot(m, name); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++func (vfs *VFS) checkMoveSlot(m *safeMoveState, name string) error {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+-	for i := range m.nativeHistory {
+-		job := &m.nativeHistory[i]
+-		if moveUnder(name, job.source) || moveUnder(job.source, name) {
+-			job.pathValid = false
+-		}
+-	}
+-}
+-
+-// CheckMovePath keeps affected native objects retryable without stalling unrelated browsing.
+-func (vfs *VFS) CheckMovePath(name string) error {
+-	name = strings.Trim(name, "/")
+-	m := &vfs.safeMoves
+-	m.mu.Lock()
+-	defer m.mu.Unlock()
+-	vfs.loadMove()
++	vfs.loadMoveAt(m)
+ 	if m.loadError != nil {
+ 		return syscall.EIO
+ 	}
+ 	if j := m.native; j != nil && !j.done {
+-		if moveUnder(name, j.source) || moveUnder(name, j.destination) {
++		if vfs.inMoveScope(name, j.source, j.destination, j.exclusive) {
+ 			return syscall.EBUSY
+ 		}
+ 	}
+ 	if m.pending && m.journal != nil {
+-		if moveUnder(name, m.journal.Source) || moveUnder(name, m.journal.Destination) {
++		if vfs.inMoveScope(name, m.journal.Source, m.journal.Destination, m.journal.Exclusive) {
+ 			if m.active {
+ 				return syscall.EBUSY
+ 			}
+@@ -167,14 +196,12 @@
+ 
+ // beginMoveCommit excludes native handle resolution only for the in-memory commit.
+ // The move gate protects commitRelease until endMoveCommit.
+-func (vfs *VFS) beginMoveCommit() {
+-	m := &vfs.safeMoves
++func (m *safeMoveState) beginMoveCommit() {
+ 	if m.commitRelease == nil && m.namespaceLock != nil {
+ 		m.commitRelease = m.namespaceLock()
+ 	}
+ }
+-func (vfs *VFS) endMoveCommit() {
+-	m := &vfs.safeMoves
++func (m *safeMoveState) endMoveCommit() {
+ 	if m.commitRelease != nil {
+ 		release := m.commitRelease
+ 		m.commitRelease = nil
+--- a/vfs/safe_moves.go
++++ b/vfs/safe_moves.go
+@@ -42,15 +42,26 @@
+ }
+ 
+ type moveJournal struct {
+-	ID          string       `json:"id"`
+-	Version     int          `json:"version"`
+-	Binding     string       `json:"binding"`
+-	Source      string       `json:"source"`
+-	Destination string       `json:"destination"`
+-	Directory   bool         `json:"directory"`
+-	Complete    bool         `json:"complete"`
+-	Objects     []moveObject `json:"objects"`
+-	Directories []string     `json:"directories"`
++	// The active NFS handle cache is process-local. Do not replay a successful
++	// rebase against newly issued destination handles on a same-process resume.
++	primaryHandlesPublished   bool
++	companionHandlesPublished bool
++	AppleDouble               bool   `json:"appleDouble,omitempty"`
++	FailureKind               string `json:"failureKind,omitempty"`
++	Failed                    bool   `json:"failed,omitempty"`
++	Preparing                 bool   `json:"preparing,omitempty"`
++	Exclusive                 bool   `json:"exclusive,omitempty"`
++	slot                      int
++	RequestID                 string       `json:"requestID,omitempty"`
++	ID                        string       `json:"id"`
++	Version                   int          `json:"version"`
++	Binding                   string       `json:"binding"`
++	Source                    string       `json:"source"`
++	Destination               string       `json:"destination"`
++	Directory                 bool         `json:"directory"`
++	Complete                  bool         `json:"complete"`
++	Objects                   []moveObject `json:"objects"`
++	Directories               []string     `json:"directories"`
+ }
+ 
+ type safeMoveState struct {
+@@ -88,8 +99,7 @@
+ func moveUnder(p, prefix string) bool { return p == prefix || strings.HasPrefix(p, prefix+"/") }
+ 
+ // loadMove is called with moves.mu held. Corrupt or foreign records fail closed.
+-func (vfs *VFS) loadMove() {
+-	m := &vfs.safeMoves
++func (vfs *VFS) loadMoveAt(m *safeMoveState) {
+ 	if m.loaded {
+ 		return
+ 	}
+@@ -97,7 +107,7 @@
+ 	if vfs.Opt.MoveJournal == "" {
+ 		return
+ 	}
+-	filename := filepath.Join(vfs.Opt.MoveJournal, "move.json")
++	filename := filepath.Join(vfs.Opt.MoveJournal, moveRecordName(vfs.slotIndex(m)))
+ 	info, err := os.Lstat(filename)
+ 	if errors.Is(err, os.ErrNotExist) {
+ 		return
+@@ -110,6 +120,7 @@
+ 		data, err = os.ReadFile(filename)
+ 	}
+ 	var j moveJournal
++	j.slot = vfs.slotIndex(m)
+ 	if err == nil {
+ 		err = json.Unmarshal(data, &j)
+ 	}
+@@ -117,17 +128,42 @@
+ 		err = fmt.Errorf("invalid move binding")
+ 	}
+ 	if err == nil {
++		_, invalidID := hex.DecodeString(j.ID)
++		if (j.Failed && (!j.Exclusive || j.Preparing || j.Complete || len(j.Objects) != 0 || len(j.Directories) != 0)) || invalidID != nil || intersect(vfs.normMove(j.Source), vfs.normMove(j.Destination)) || (j.Preparing && (!j.Exclusive || j.Complete || len(j.Objects) != 0 || len(j.Directories) != 0)) || (j.Exclusive && j.RequestID == "") {
++			err = fmt.Errorf("invalid move identity or endpoints")
++		}
++	}
++	if err == nil {
++		seen := map[string]bool{}
++		sidecarCount := 0
++		primaryCount := 0
+ 		for _, o := range j.Objects {
+-			if !movePath(o.Source) || !movePath(o.Destination) || !moveUnder(o.Source, j.Source) || o.Destination != j.Destination+strings.TrimPrefix(o.Source, j.Source) || o.Size < 0 {
++			normal := (j.Directory || o.Source == j.Source) && moveUnder(o.Source, j.Source) && o.Destination == j.Destination+strings.TrimPrefix(o.Source, j.Source)
++			if o.Source == j.Source && o.Destination == j.Destination {
++				primaryCount++
++			}
++			companion := j.isCompanion(o)
++			if companion {
++				sidecarCount++
++			}
++			if seen[o.Source] || !movePath(o.Source) || !movePath(o.Destination) || (!normal && !companion) || o.Size < 0 {
+ 				err = fmt.Errorf("invalid move entry")
+ 				break
+ 			}
++			seen[o.Source] = true
++		}
++		if !j.Directory && !j.Preparing && !j.Failed && (primaryCount != 1 || len(j.Directories) != 0) {
++			err = fmt.Errorf("invalid primary file inventory")
++		}
++		if j.AppleDouble && (!j.Exclusive || j.Preparing || j.Failed || sidecarCount != 1) {
++			err = fmt.Errorf("invalid sidecar inventory")
+ 		}
+ 		for _, d := range j.Directories {
+-			if !movePath(d) || !moveUnder(d, j.Source) {
++			if seen[d] || !movePath(d) || !moveUnder(d, j.Source) {
+ 				err = fmt.Errorf("invalid move directory")
+ 				break
+ 			}
++			seen[d] = true
+ 		}
+ 	}
+ 	if err != nil {
+@@ -141,9 +177,12 @@
+ 		return
+ 	}
+ 	m.journal = &j
+-	m.pending = !j.Complete
++	m.pending = !j.Complete && !j.Failed
+ 	m.total = len(j.Objects)
+-	if j.Complete {
++	if j.Failed {
++		m.phase = "failed"
++		m.problem = preflightMessage(j.FailureKind)
++	} else if j.Complete {
+ 		m.phase = "completed"
+ 		m.completed = m.total
+ 	} else {
+@@ -187,7 +226,7 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	if err = os.Rename(f.Name(), filepath.Join(dir, "move.json")); err != nil {
++	if err = os.Rename(f.Name(), filepath.Join(dir, moveRecordName(j.slot))); err != nil {
+ 		return err
+ 	}
+ 	d, err := os.Open(dir)
+@@ -198,8 +237,7 @@
+ 	return d.Sync()
+ }
+ 
+-func (vfs *VFS) movePhase(phase string, completed, total int) {
+-	m := &vfs.safeMoves
++func (m *safeMoveState) movePhase(phase string, completed, total int) {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+ 	m.phase = phase
+@@ -208,63 +246,30 @@
+ }
+ 
+ // MoveStatus returns bounded move activity independently of the upload queue.
+-func (vfs *VFS) MoveStatus() rc.Params {
+-	m := &vfs.safeMoves
+-	m.mu.Lock()
+-	defer m.mu.Unlock()
+-	vfs.loadMove()
+-	pending := m.loadError != nil || m.pending
+-	active := m.active || (m.native != nil && !m.native.done)
+-	phase := m.phase
+-	if phase == "" {
+-		phase = "idle"
+-	}
+-	if active && phase != "preparing" && phase != "copying" && phase != "verifying" && phase != "removing" {
+-		phase = "preparing"
+-	}
+-	return rc.Params{"version": 1, "enabled": vfs.Opt.MoveJournal != "", "active": active, "needsRecovery": pending && !active, "phase": phase, "completed": m.completed, "total": m.total, "message": m.problem}
+-}
+-
+ // LockMoveMutation excludes native writers during a rename or recovery.
+ // The caller must release the returned lock after the file is closed.
+-func (vfs *VFS) LockMoveMutation() (func(), error) {
+-	m := &vfs.safeMoves
+-	if !m.gate.TryRLock() {
+-		return nil, syscall.EBUSY
+-	}
+-	m.mu.Lock()
+-	vfs.loadMove()
+-	var blocked error
+-	if m.active || (m.native != nil && !m.native.done) {
+-		blocked = syscall.EBUSY
+-	} else if m.loadError != nil || m.pending {
+-		blocked = syscall.EIO
+-	}
+-	if blocked == nil {
+-		m.epoch++
+-	}
+-	m.mu.Unlock()
+-	if blocked != nil {
+-		m.gate.RUnlock()
+-		return nil, blocked
+-	}
+-	return m.gate.RUnlock, nil
+-}
+-
+ // SetMoveNamespaceLocker coordinates recovery with native handle resolution.
+-func (vfs *VFS) SetMoveNamespaceLocker(fn func() func()) { vfs.safeMoves.namespaceLock = fn }
++func (vfs *VFS) SetMoveNamespaceLocker(fn func() func()) {
++	for _, m := range vfs.slots() {
++		m.namespaceLock = fn
++	}
++}
+ 
+ // SetMoveHandleRenamer installs the native handler's recovery callback before serving.
+-func (vfs *VFS) SetMoveHandleRenamer(fn func(string, string) error) { vfs.safeMoves.onResume = fn }
+-
+-func (vfs *VFS) safeRename(oldName, newName string, rename func() error) (err error) {
+-	m := &vfs.safeMoves
++func (vfs *VFS) SetMoveHandleRenamer(fn func(string, string) error) {
++	for _, m := range vfs.slots() {
++		m.onResume = fn
++	}
++}
++
++func (vfs *VFS) safeRenameAt(m *safeMoveState, oldName, newName string) (err error) {
+ 	m.gate.Lock()
+ 	defer m.gate.Unlock()
+-	defer vfs.endMoveCommit()
++	defer m.endMoveCommit()
+ 	m.mu.Lock()
+-	vfs.loadMove()
+-	if m.loadError != nil || m.pending {
++	vfs.loadMoveAt(m)
++	ownIntent := m.native != nil && m.journal != nil && m.journal.Preparing && m.native.id == m.journal.ID
++	if m.loadError != nil || (m.pending && !ownIntent) {
+ 		m.mu.Unlock()
+ 		return syscall.EBUSY
+ 	}
+@@ -303,6 +308,12 @@
+ 		return syscall.EINVAL
+ 	}
+ 	dest, statErr := vfs.Stat(newName)
++	m.mu.Lock()
++	exclusive := m.native != nil && m.native.exclusive && !m.native.done
++	m.mu.Unlock()
++	if exclusive && dest != nil {
++		return syscall.EEXIST
++	}
+ 	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+ 		return statErr
+ 	}
+@@ -323,8 +334,12 @@
+ 			}
+ 		}
+ 	}
+-	if vfs.cache != nil && (vfs.cache.BusyMovePrefix(oldName) || vfs.cache.BusyMovePrefix(newName)) {
+-		return syscall.EBUSY
++	if vfs.cache != nil {
++		for _, p := range moveEndpoints(oldName, newName, exclusive) {
++			if vfs.cache.BusyMovePrefix(p) {
++				return syscall.EBUSY
++			}
++		}
+ 	}
+ 	m.mu.Lock()
+ 	m.active = true
+@@ -356,20 +371,28 @@
+ 		vfs.noteMetadataChange(newName, node.IsDir())
+ 	}()
+ 	if features := vfs.f.Features(); features.Copy == nil || features.Move != nil || features.DirMove != nil {
+-		vfs.beginMoveCommit()
+-	}
+-	err = rename()
++		m.beginMoveCommit()
++	}
++	err = vfs.renameWithSlot(oldName, newName, m)
+ 	if err == nil {
+-		vfs.beginMoveCommit()
+-		if m.onResume != nil {
+-			if e := m.onResume(oldName, newName); e != nil {
+-				return e
+-			}
+-		}
++		m.beginMoveCommit()
+ 		m.mu.Lock()
+ 		j := m.journal
+ 		m.mu.Unlock()
++		if j != nil && !j.Complete && !j.Failed {
++			if e := publishHandleRename(m, &j.primaryHandlesPublished, oldName, newName); e != nil {
++				return e
++			}
++		} else if m.onResume != nil {
++			if e := m.onResume(oldName, newName); e != nil {
++				return e
++			}
++		}
+ 		if j != nil && !j.Complete {
++			if e := vfs.publishMoveCache(j, m); e != nil {
++				return e
++			}
++			j.Preparing = false
+ 			j.Complete = true
+ 			if e := vfs.saveMove(j); e != nil {
+ 				j.Complete = false
+@@ -381,7 +404,7 @@
+ 		m.active = false
+ 		m.mu.Unlock()
+ 		vfs.root.touchMoveDirectories()
+-		vfs.movePhase("completed", m.total, m.total)
++		m.movePhase("completed", m.total, m.total)
+ 	}
+ 	return err
+ }
+@@ -399,11 +422,22 @@
+ 
+ // journalRemoteMove copies every object before deleting any source object.
+ func (vfs *VFS) journalRemoteMove(ctx context.Context, source, destination string, directory bool) (fs.Object, error) {
++	return vfs.journalRemoteMoveAt(&vfs.safeMoves, ctx, source, destination, directory)
++}
++func (vfs *VFS) journalRemoteMoveAt(m *safeMoveState, ctx context.Context, source, destination string, directory bool) (fs.Object, error) {
+ 	id := make([]byte, 16)
+ 	if _, err := rand.Read(id); err != nil {
+ 		return nil, err
+ 	}
+ 	j := &moveJournal{ID: hex.EncodeToString(id), Version: 1, Binding: vfs.moveBinding(), Source: source, Destination: destination, Directory: directory}
++	j.slot = vfs.slotIndex(m)
++	m.mu.Lock()
++	if job := m.native; job != nil && !job.done {
++		j.ID = job.id
++		j.RequestID = job.requestID
++		j.Exclusive = job.exclusive
++	}
++	m.mu.Unlock()
+ 	if directory {
+ 		// Walk callbacks run under the walker's coordinator lock. Collect keys
+ 		// only; metadata HEADs are fetched independently after the walk finishes.
+@@ -423,7 +457,7 @@
+ 					j.Objects = append(j.Objects, moveObject{Source: o.Remote(), Destination: destination + strings.TrimPrefix(o.Remote(), source)})
+ 				}
+ 			}
+-			vfs.movePhase("preparing", 0, len(j.Objects))
++			m.movePhase("preparing", 0, len(j.Objects))
+ 			return nil
+ 		})
+ 		if err != nil {
+@@ -433,8 +467,11 @@
+ 	} else {
+ 		j.Objects = []moveObject{{Source: source, Destination: destination}}
+ 	}
++	if err := vfs.inventoryCompanion(ctx, j); err != nil {
++		return nil, err
++	}
+ 	prepared := &moveReceipts{}
+-	vfs.movePhase("preparing", 0, len(j.Objects))
++	m.movePhase("preparing", 0, len(j.Objects))
+ 	if err := moveParallel(ctx, len(j.Objects), moveMetadataConcurrency, func(taskCtx context.Context, index int) error {
+ 		r := &j.Objects[index]
+ 		_, err := moveRequest(taskCtx, moveMetadataTimeout, func(requestCtx context.Context) (struct{}, error) {
+@@ -454,12 +491,23 @@
+ 			return err
+ 		}
+ 		prepared.mu.Lock()
+-		prepared.advance(vfs, "preparing", len(j.Objects))
++		prepared.advance(m, "preparing", len(j.Objects))
+ 		prepared.mu.Unlock()
+ 		return nil
+ 	}); err != nil {
+ 		return nil, err
+ 	}
++	if j.Exclusive {
++		adapter, ok := vfs.f.(exclusiveMoveCopier)
++		if !ok {
++			return nil, fmt.Errorf("backend lacks guarded copy")
++		}
++		for _, r := range j.Objects {
++			if err := adapter.CheckExclusiveMoveCopy(r.Size); err != nil {
++				return nil, fmt.Errorf("%w: %v", errMovePreflight, err)
++			}
++		}
++	}
+ 	// Reserve checksum growth before publishing an inventory or copying objects.
+ 	initial, err := json.Marshal(j)
+ 	if err != nil {
+@@ -468,7 +516,6 @@
+ 	if len(initial)+128*len(j.Objects) > moveJournalLimit {
+ 		return nil, fmt.Errorf("move exceeds record limit")
+ 	}
+-	m := &vfs.safeMoves
+ 	m.mu.Lock()
+ 	m.journal = j
+ 	m.pending = true
+@@ -489,21 +536,22 @@
+ }
+ 
+ func (vfs *VFS) runMove(ctx context.Context, j *moveJournal) error {
++	m := vfs.slots()[j.slot]
+ 	for index, d := range j.Directories {
+ 		if err := moveRequestError(ctx, moveMetadataTimeout, func(requestCtx context.Context) error {
+ 			return vfs.f.Mkdir(requestCtx, j.Destination+strings.TrimPrefix(d, j.Source))
+ 		}); err != nil {
+ 			return err
+ 		}
+-		vfs.movePhase("preparing", index+1, len(j.Directories))
++		m.movePhase("preparing", index+1, len(j.Directories))
+ 	}
+ 	copied := &moveReceipts{}
+-	vfs.movePhase("copying", 0, len(j.Objects))
++	m.movePhase("copying", 0, len(j.Objects))
+ 	if err := moveParallel(ctx, len(j.Objects), movePayloadConcurrency, func(taskCtx context.Context, index int) error {
+ 		r := &j.Objects[index]
+ 		if r.Verified {
+ 			copied.mu.Lock()
+-			copied.advance(vfs, "copying", len(j.Objects))
++			copied.advance(m, "copying", len(j.Objects))
+ 			copied.mu.Unlock()
+ 			return nil
+ 		}
+@@ -511,6 +559,15 @@
+ 			src, e := vfs.f.NewObject(requestCtx, r.Source)
+ 			if e != nil {
+ 				return nil, e
++			}
++			if j.isCompanion(*r) {
++				valid, e := isAppleDouble(requestCtx, src)
++				if e != nil {
++					return nil, e
++				}
++				if !valid {
++					return nil, fmt.Errorf("source sidecar changed")
++				}
+ 			}
+ 			if !vfs.objectMatches(requestCtx, src, r) {
+ 				return nil, fmt.Errorf("source changed")
+@@ -525,6 +582,13 @@
+ 		r.DestinationMD5 = ""
+ 		r.DestinationModTime = nil
+ 		dst, err := moveRequest(taskCtx, moveCopyTimeout, func(requestCtx context.Context) (fs.Object, error) {
++			if j.Exclusive {
++				a, ok := vfs.f.(exclusiveMoveCopier)
++				if !ok {
++					return nil, fmt.Errorf("backend lacks guarded copy")
++				}
++				return a.CopyExclusiveMove(requestCtx, src, r.Destination, j.ID)
++			}
+ 			return vfs.f.Features().Copy(requestCtx, src, r.Destination)
+ 		})
+ 		if err != nil {
+@@ -559,7 +623,7 @@
+ 			r.DestinationModTime = nil
+ 			return err
+ 		}
+-		copied.advance(vfs, "copying", len(j.Objects))
++		copied.advance(m, "copying", len(j.Objects))
+ 		return nil
+ 	}); err != nil {
+ 		return err
+@@ -569,7 +633,7 @@
+ 	// deletion work; a known changed destination must not trigger other deletes.
+ 	deletionSources := make([]fs.Object, len(j.Objects))
+ 	checked := &moveReceipts{}
+-	vfs.movePhase("verifying", 0, len(j.Objects))
++	m.movePhase("verifying", 0, len(j.Objects))
+ 	if err := moveParallel(ctx, len(j.Objects), moveMetadataConcurrency, func(taskCtx context.Context, index int) error {
+ 		r := &j.Objects[index]
+ 		if !r.Deleted {
+@@ -599,24 +663,58 @@
+ 			deletionSources[index] = src
+ 		}
+ 		checked.mu.Lock()
+-		checked.advance(vfs, "verifying", len(j.Objects))
++		checked.advance(m, "verifying", len(j.Objects))
+ 		checked.mu.Unlock()
+ 		return nil
+ 	}); err != nil {
+ 		return err
+ 	}
+ 	removed := &moveReceipts{}
+-	vfs.movePhase("removing", 0, len(j.Objects))
++	m.movePhase("removing", 0, len(j.Objects))
+ 	if err := moveParallel(ctx, len(j.Objects), movePayloadConcurrency, func(taskCtx context.Context, index int) error {
+ 		r := &j.Objects[index]
+ 		if r.Deleted {
+ 			removed.mu.Lock()
+-			removed.advance(vfs, "removing", len(j.Objects))
++			removed.advance(m, "removing", len(j.Objects))
+ 			removed.mu.Unlock()
+ 			return nil
+ 		}
+ 		if src := deletionSources[index]; src != nil {
+-			if err := moveRequestError(taskCtx, moveMetadataTimeout, src.Remove); err != nil {
++			if err := moveRequestError(taskCtx, moveMetadataTimeout, func(ctx context.Context) error {
++				fresh, err := vfs.f.NewObject(ctx, r.Source)
++				if err != nil {
++					return err
++				}
++				if j.isCompanion(*r) {
++					valid, e := isAppleDouble(ctx, fresh)
++					if e != nil {
++						return e
++					}
++					if !valid {
++						return fmt.Errorf("source sidecar changed before removal")
++					}
++				}
++				if !vfs.objectMatches(ctx, fresh, r) {
++					return fmt.Errorf("source changed at removal")
++				}
++				dst, err := vfs.f.NewObject(ctx, r.Destination)
++				if err != nil {
++					return err
++				}
++				if !vfs.destinationMatches(ctx, dst, r) {
++					return fmt.Errorf("destination changed at removal")
++				}
++				if j.Exclusive {
++					a, ok := vfs.f.(exclusiveMoveCopier)
++					if !ok {
++						return fmt.Errorf("guarded verification unavailable")
++					}
++					if err := a.VerifyExclusiveMove(ctx, fresh, r.Destination, j.ID); err != nil {
++						return err
++					}
++				}
++				return fresh.Remove(ctx)
++			}); err != nil {
+ 				return err
+ 			}
+ 		}
+@@ -627,7 +725,7 @@
+ 			r.Deleted = false
+ 			return err
+ 		}
+-		removed.advance(vfs, "removing", len(j.Objects))
++		removed.advance(m, "removing", len(j.Objects))
+ 		return nil
+ 	}); err != nil {
+ 		return err
+@@ -643,23 +741,37 @@
+ 			return err
+ 		}
+ 	}
+-	return nil
++	return vfs.prepareCompanionCache(ctx, j)
+ }
+ 
+ // ResumeMove reserves one recovery task; polling the status never starts mutations.
+-func (vfs *VFS) ResumeMove() error {
+-	m := &vfs.safeMoves
++func (vfs *VFS) resumeSlot(m *safeMoveState) error {
+ 	if !m.gate.TryLock() {
+ 		return syscall.EBUSY
+ 	}
+ 	m.mu.Lock()
+-	vfs.loadMove()
++	vfs.loadMoveAt(m)
+ 	if m.loadError != nil || m.journal == nil || !m.pending || m.active || vfs.f.Features().Copy == nil {
+ 		m.mu.Unlock()
+ 		m.gate.Unlock()
+ 		return fmt.Errorf("no resumable move")
+ 	}
+ 	j := m.journal
++	if j.Preparing {
++		if !j.Exclusive {
++			m.mu.Unlock()
++			m.gate.Unlock()
++			return fmt.Errorf("invalid preparation record")
++		}
++		m.native = &nativeMove{id: j.ID, requestID: j.RequestID, source: j.Source, destination: j.Destination, exclusive: true}
++		m.active = true
++		m.phase = "preparing"
++		m.problem = ""
++		m.mu.Unlock()
++		m.gate.Unlock()
++		go vfs.executeNative(m, m.native)
++		return nil
++	}
+ 	m.active = true
+ 	m.phase = "preparing"
+ 	m.problem = ""
+@@ -669,26 +781,30 @@
+ 	go func() {
+ 		m.gate.Lock()
+ 		defer m.gate.Unlock()
+-		defer vfs.endMoveCommit()
++		defer m.endMoveCommit()
+ 		ctx := vfs.ctx
+ 		err := vfs.saveMove(j)
+ 		if err == nil {
+ 			err = vfs.runMove(ctx, j)
+ 		}
+ 		if err == nil {
+-			vfs.beginMoveCommit()
+-		}
+-		if err == nil && m.onResume != nil {
+-			err = m.onResume(j.Source, j.Destination)
++			m.beginMoveCommit()
+ 		}
+ 		if err == nil {
++			err = publishHandleRename(m, &j.primaryHandlesPublished, j.Source, j.Destination)
++		}
++		if err == nil {
++			err = vfs.publishMoveCache(j, m)
++		}
++		if err == nil {
++			j.Preparing = false
+ 			j.Complete = true
+ 			err = vfs.saveMove(j)
+ 			if err != nil {
+ 				j.Complete = false
+ 			}
+ 		}
+-		vfs.beginMoveCommit()
++		m.beginMoveCommit()
+ 		vfs.root.ForgetAll()
+ 		vfs.noteMetadataChange(j.Source, j.Directory)
+ 		vfs.noteMetadataChange(j.Destination, j.Directory)
+@@ -725,7 +841,14 @@
+ 			if e != nil || !resume {
+ 				return nil, fmt.Errorf("resume must be true")
+ 			}
+-			if e = v.ResumeMove(); e != nil {
++			id := ""
++			if _, has := in["id"]; has {
++				id, e = in.GetString("id")
++				if e != nil || id == "" {
++					return nil, fmt.Errorf("invalid id")
++				}
++			}
++			if e = v.resumeMoveID(id); e != nil {
+ 				return nil, e
+ 			}
+ 		}
+--- a/vfs/vfs.go
++++ b/vfs/vfs.go
+@@ -31,6 +31,7 @@
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
++	"syscall"
+ 	"time"
+ 
+ 	"slices"
+@@ -179,6 +180,10 @@
+ // VFS represents the top level filing system
+ type VFS struct {
+ 	safeMoves       safeMoveState
++	moveSlots       [3]safeMoveState
++	moveAdmission   sync.Mutex
++	moveLoadOnce    sync.Once
++	moveWriters     map[string]int
+ 	metadataChanges metadataChanges
+ 	f               fs.Fs
+ 	ctx             context.Context
+@@ -650,12 +655,30 @@
+ // Rename oldName to newName
+ func (vfs *VFS) Rename(oldName, newName string) error {
+ 	if vfs.Opt.MoveJournal != "" {
+-		return vfs.safeRename(oldName, newName, func() error { return vfs.rename(oldName, newName) })
++		vfs.ensureMoveRegistry()
++		vfs.moveAdmission.Lock()
++		defer vfs.moveAdmission.Unlock()
++		for _, slot := range vfs.slots() {
++			slot.mu.Lock()
++			vfs.loadMoveAt(slot)
++			blocked := slot.busy() || slot.pending || slot.loadError != nil
++			slot.mu.Unlock()
++			if blocked {
++				return syscall.EBUSY
++			}
++		}
++		if vfs.writerConflict(oldName, newName, false) {
++			return syscall.EBUSY
++		}
++		return vfs.safeRenameAt(&vfs.safeMoves, oldName, newName)
+ 	}
+ 	return vfs.rename(oldName, newName)
+ }
+ 
+ func (vfs *VFS) rename(oldName, newName string) error {
++	return vfs.renameWithSlot(oldName, newName, &vfs.safeMoves)
++}
++func (vfs *VFS) renameWithSlot(oldName, newName string, m *safeMoveState) error {
+ 	// find the parent directories
+ 	oldDir, oldLeaf, err := vfs.StatParent(oldName)
+ 	if err != nil {
+@@ -665,7 +688,7 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	err = oldDir.Rename(oldLeaf, newLeaf, newDir)
++	err = oldDir.renameWithSlot(oldLeaf, newLeaf, newDir, m)
+ 	if err != nil {
+ 		return err
+ 	}

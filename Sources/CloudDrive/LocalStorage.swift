@@ -38,8 +38,8 @@ enum LocalStorageScanner {
                 if name == "." || name == ".." { continue }
                 count += 1
                 let child = relative.isEmpty ? name : relative + "/" + name
-                // Never stat/traverse the NFS mount. It can block, hydrate or be stale.
-                if child == "Drive" { continue }
+                // Never stat/traverse either filesystem mount. It can block, hydrate or be stale.
+                if child == "Drive" || child == "Instant Drive" { continue }
                 var info = stat()
                 guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { complete = false; continue }
                 guard info.st_dev == rootStat.st_dev else { complete = false; continue }

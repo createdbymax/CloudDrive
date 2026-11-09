@@ -1,0 +1,15 @@
+{
+  "build": "43",
+  "appSHA256": "d430d1ff1478b83818d39a1d2ee329265d41553c09b2fec2b8583c0a700fa373",
+  "ownerSHA256": "847f02d52f10fcd8af31b5d1df8831a181e78f7e71ccfd580a02abc1d0d8d4ea",
+  "extensionSHA256": "cd2639a76d99a13371d2615907d90f0c64843842aba70cffd67f41ca9663331b",
+  "originalEntriesMatched": 11845,
+  "originalLogicalBytes": 118965763111,
+  "originalR2ChecksumsMatchedThroughPersonalMount": 3,
+  "originalNFSMountRetired": true,
+  "startedNormally": true,
+  "mountIDRecorded": true,
+  "localRevision": 36,
+  "publishedRevision": 36,
+  "finderItemsInCompletedPersonalGroup": 12
+}

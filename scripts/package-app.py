@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import signing
+import fskit_packaging
+import finder_packaging
 from sparkle_config import update_metadata, configured_environment
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -19,7 +21,9 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 def check_inactive(app):
     processes = subprocess.check_output(['/bin/ps', '-axo', 'comm='], text=True).splitlines()
     owned = {str(app/'Contents/MacOS/CloudDrive'), str(app/'Contents/Resources/rclone'),
-             str(app/'Contents/Resources/CloudDriveHelper')}
+             str(app/'Contents/Resources/CloudDriveHelper'), str(app/'Contents/Resources/CloudDriveEngine'),
+             str(app/'Contents/Extensions/CloudDriveFS.appex/Contents/MacOS/CloudDriveFS')}
+    owned.add(str(app/'Contents/PlugIns/CloudDriveFinder.appex/Contents/MacOS/CloudDriveFinder'))
     if any(line.strip() in owned for line in processes):
         raise RuntimeError('This build is active. Eject its drive and quit it before rebuilding.')
 
@@ -42,6 +46,7 @@ def validate_backend_notices(backend):
 def package(app, products, backend):
     metadata = update_metadata(configured_environment(os.environ))
     check_inactive(app)
+    fskit_profile = fskit_packaging.requested_profile(os.environ)
     if not backend.is_file() or not os.access(backend, os.X_OK):
         raise RuntimeError('Build the backend first: python3 scripts/build-rclone-allocation.py')
     notices = validate_backend_notices(backend)
@@ -60,6 +65,11 @@ def package(app, products, backend):
     copies = [(executable, app/'Contents/MacOS/CloudDrive'),
               (products/'CloudDriveHelper', resources/'CloudDriveHelper'),
               (backend, resources/'rclone'), (ROOT/'LICENSE', resources/'CloudDrive-LICENSE.txt')]
+    engine = products/'CloudDriveEngine'
+    if (ROOT/'Sources/CloudDriveEngine').is_dir():
+        if not engine.is_file():
+            raise RuntimeError('Build CloudDriveEngine before packaging the namespace-enabled app.')
+        copies.append((engine, resources/'CloudDriveEngine'))
     copies += [(ROOT/'vendor'/name, resources/name) for name in
                ['RCLONE-LICENSE.txt', 'GO-NFS-LICENSE.txt', 'THIRD_PARTY_CHANGES.md', 'RCLONE_BUILD.json']]
     for source, destination in copies:
@@ -95,19 +105,32 @@ def package(app, products, backend):
              'CFBundleVersion': build, 'LSMinimumSystemVersion': '14.0',
              'NSHighResolutionCapable': True}
     plist.update(metadata)
+    plist['CFBundleURLTypes'] = [{'CFBundleURLName': 'local.bucketdrive.app.finder-actions',
+                                'CFBundleURLSchemes': ['clouddrive'], 'CFBundleTypeRole': 'Viewer'}]
     (app/'Contents/Info.plist').write_bytes(plistlib.dumps(plist))
-    files = sorted([*ROOT.glob('Sources/**/*.swift'), *ROOT.glob('Assets/*.png'), *ROOT.glob('scripts/*.*'),
+    files = sorted([*ROOT.glob('Sources/**/*.swift'), *ROOT.glob('Sources/**/*.plist'), *ROOT.glob('Sources/**/*.entitlements'), *ROOT.glob('Assets/*.png'), *ROOT.glob('scripts/*.*'),
                     *ROOT.glob('vendor/patches/*.patch'), ROOT/'vendor/RCLONE_BUILD.json',
                     ROOT/'release-config.json', ROOT/'Package.resolved', ROOT/'Package.swift', *ROOT.glob('CloudDrive.xcodeproj/project.pbxproj')])
     source_commit = os.environ.get('CLOUDDRIVE_SOURCE_COMMIT')
     if source_commit is not None and not re.fullmatch(r'[a-f0-9]{40}', source_commit):
         raise RuntimeError('Source commit must be a full Git SHA.')
+    if engine.is_file():
+        signing.sign_target(resources/'CloudDriveEngine', signing.APP_ID+'.engine', signing.selection(),
+                            fskit_profile[2] if fskit_profile else None)
+    extension = fskit_packaging.embed_extension(app, products, ROOT, version, build, fskit_profile, signing)
+    finder_extension = finder_packaging.embed_extension(app, products, ROOT, version, build, signing)
     info = {'version': version, 'build': build, 'sourceCommit': source_commit,
             'builtAtUTC': datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'sources': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
             'rcloneSHA256': hashlib.sha256((resources/'rclone').read_bytes()).hexdigest()}
+    if engine.is_file():
+        info['engineSHA256'] = hashlib.sha256((resources/'CloudDriveEngine').read_bytes()).hexdigest()
+    info['filesystemExtension'] = None if extension is None else {
+        'bundleID': fskit_packaging.EXTENSION_ID,
+        'executableSHA256': hashlib.sha256((extension/'Contents/MacOS/CloudDriveFS').read_bytes()).hexdigest()}
+    info['finderExtension'] = finder_extension
     (resources/'BuildInfo.json').write_text(json.dumps(info, indent=2)+'\n')
-    signing.sign(app)
+    signing.sign(app, fskit_profile[2] if fskit_profile else None)
     print(app)
 
 

@@ -153,7 +153,7 @@ def main():
         d=control()['diskCache'];return all(type(d[k])is int and d[k]==0 for k in ('uploadsQueued','uploadsInProgress','erroredFiles')) and d['outOfSpace'] is False
     try:
         local.until(control);cache_root=pathlib.Path(control()['diskCache']['path']);assert cache in cache_root.parents
-        local.command(['/sbin/mount_nfs','-o',f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,nodev,nosuid','127.0.0.1:/',str(mount)])
+        local.command(['/sbin/mount_nfs','-o',f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,mutejukebox,nodev,nosuid','127.0.0.1:/',str(mount)])
         for size_mib in args.sizes_mib:
             size=size_mib*MiB
             if shutil.disk_usage(root).free<4*size+2*1024*MiB:

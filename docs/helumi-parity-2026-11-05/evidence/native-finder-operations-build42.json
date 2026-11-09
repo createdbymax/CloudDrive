@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "status": "pass",
+  "mode": "managed",
+  "engineSHA256": "68763748f4883d22f123deaf17a31b40f04061b44b38853a1672ce3a7efd33f7",
+  "host": {
+    "macOS": "27.3",
+    "architecture": "arm64"
+  },
+  "passed": [
+    "installed FSKit extension mounted authenticated isolated owner resource",
+    "native computed availability: repeated remoteOnly, pinned availableOffline, freed remoteOnly",
+    "native mkdir, create, write, fsync, read and SHA256 content",
+    "folder rename retains inode, content and open handle",
+    "unlink keeps open file readable and writable until close",
+    "rmdir and unrelated imported file read",
+    "two concurrent native moves to one parent acknowledged while cloud publication was paused",
+    "atomic editor save over unpublished destination preserves both open file descriptions",
+    "synthetic background publication drained",
+    "normal native unmount confirmed"
+  ]
+}

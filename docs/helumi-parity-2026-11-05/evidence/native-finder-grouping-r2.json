@@ -1,0 +1,34 @@
+{
+  "build": 39,
+  "samples": [
+    {
+      "drive": "CloudDrive",
+      "copySeconds": null,
+      "groupSeconds": 1.25,
+      "method": "Finder New Folder with Selection",
+      "groupedFolders": 12,
+      "descendants": 765,
+      "matchedFiles": 765,
+      "finderPayloadsHashed": 12
+    },
+    {
+      "drive": "Helumi",
+      "groupSeconds": 0.994,
+      "method": "Finder New Folder with Selection",
+      "groupedFolders": 12,
+      "descendants": 765,
+      "matchedFiles": 765,
+      "finderPayloadsHashed": 12
+    }
+  ],
+  "appSHA256": "7c86d8727f856f6330404253a4f0303f18d1f5c4de193c085dc37b5778ac1f07",
+  "signedDiagnosticReportSHA256": "653134548b41051f3c182b3ae47efc2bb7801de158434aa974e452cae286d378",
+  "independentlyVerifiedRecords": 765,
+  "distinctPayloads": 12,
+  "normalUnmount": true,
+  "safeOwnerStop": true,
+  "generatedR2KeysRemoved": 235,
+  "remainingGeneratedKeys": 0,
+  "helumiFixtureRemoved": true,
+  "success": true
+}

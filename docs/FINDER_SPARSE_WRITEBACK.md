@@ -1,0 +1,40 @@
+# Can the mounted Finder drive safely release dirty ranges before an upload finishes?
+
+**Historical experiment with the build 35 worker.** A backed sparse cache is feasible, but adding APFS hole punching to the shipped NFS cache would corrupt some reads and published objects. A repeatable test on this Mac reproduced both failures after the remote chunk had already passed SHA-256 verification. The mounted drive therefore continues using its existing writeback behavior. A dense incoming file can still require local space approaching its entire payload. Sparse logical files can use much less physical space. The app’s direct uploader can read a selected source file in bounded parts. Finder dragging a file onto the mounted volume uses a different entry point.
+
+The successor implementation and current qualification are described in [Finder writeback](FINDER_WRITEBACK.md).
+
+## Two observed behaviors
+
+1. A temporary APFS file containing 8 MiB of random data took 8,388,608 allocated bytes. macOS `F_PUNCHHOLE` on its aligned middle 4 MiB reduced allocation to 4,194,304 bytes and preserved its 8,388,608-byte logical length. Ordinary reads returned zeroes throughout the punched range. Replacing that range in memory with the verified original chunk restored the original full-file hash.
+2. In an isolated build of the patched production rclone VFS, a new item received the same write pattern. The middle 4 MiB was uploaded to a disposable local object backend, downloaded and checksum-verified. After punching, production `vfscache.Item.ReadAt` returned zeroes for that range. Closing the item through normal writeback published an 8 MiB ordinary object with the same incorrect zeroes. This test exercised the actual cache and publication code on macOS. The provider fixture was local and the personal mount was untouched.
+
+The second test passing means it reproduced the corruption hazard. It is a diagnostic probe for the existing backend. A corrected backend should invert its read and publication expectations. The complete [test source](helumi-parity-2026-11-05/evidence/apfs-dirty-cache-negative-test.go.txt) uses an isolated Go test overlay. In a checkout of the patched rclone source described in `vendor/RCLONE_BUILD.json`, map the virtual `vfs/vfscache/cloud_sparse_proof_test.go` to that source in a Go overlay JSON file. Supply absolute paths for both entries under `Replace`. Run the pinned toolchain with a disposable cache, the default local fstest remote and `RCLONE_CONFIG=/dev/null`:
+
+```sh
+go test -overlay /absolute/path/to/overlay.json ./vfs/vfscache \
+  -run '^TestPunchedDirtyRangeNeedsOverlay$' -count=1 -v
+```
+
+## Why the existing cache cannot distinguish these bytes
+
+- `vfs/vfscache/item.go`, `Item.WriteAt` and `_written`, write bytes to the cache descriptor and record present intervals in `info.Rs`. That map has no immutable backing-object reference per dirty range. A marked-present punched extent still goes through the raw descriptor. Removing its presence bit routes missing reads through the downloader for the ordinary remote object. On overwrite that remote can contain old bytes. On creation it may have no bytes at all.
+- `Item._store` opens the cache pathname with `fcache.NewObject` and calls `operations.Copy`. Even a corrected interactive read path alone would leave the publication bug reproduced above. Rehydrating the entire local file before upload would restore bytes while reintroducing the disk-space requirement.
+- `go-nfs/nfs_onwrite.go` opens and closes a backend file handle per WRITE request. `nfs_oncommit.go` handles durability acknowledgments. Neither establishes the end of the Finder producer. Rewrites and truncates can follow an apparently quiet interval. Older and newer snapshots must remain distinguishable.
+- The separate [streaming experiment](../experiments/streaming-nfs/README.md) already orders a chunk PUT before a synced manifest update, overlays later writes, checks hashes during reads and supports explicit assembly. Its current engine serializes work under one mutex and rejects nested directories, rename, remove and replacement. Its synthetic S3 publisher reconstructs a final ordinary object with bounded RAM and another payload transfer. Its Go suite passed on this Mac. These capabilities demonstrate individual steps, with compatibility and throughput work still required.
+- The Swift namespace engine’s `ContentStore` already has immutable snapshots and can reclaim proven published extents. The mounted NFS worker is a separate owner written in Go. Its saved cache and move journals must remain interpretable on restart, including after an upgrade.
+
+## Smallest design that can safely release dirty payload
+
+1. **Durable per-file generations.** Bind a staging manifest to the backend identity and stable file ID. Each interval identifies local dirty bytes, a verified immutable remote chunk plus offset, a base object pinned to a validator, or logical zeroes. Track logical length and truncate generation explicitly. Preserve references held by readers and in-flight publishers across rename and replacement. Existing cache entries must be readable throughout migration.
+2. **Upload before reclaim.** Freeze an extent version, copy it to a private staged key, verify the remote bytes and durably commit its locator. Before punching a block-aligned region under the file lock, confirm the version is still current, confirm the file identity and exclude readers that could use the raw descriptor. A crash before the durable mapping must leave the local bytes intact. A crash afterward may leave duplicate copies, both recoverable. Shared physical blocks containing newer edits must remain allocated. Keep a per-volume total for outstanding dirty and transfer buffers, including concurrent files.
+3. **A common reader for browsing and publication.** Both Finder reads and the final ordinary-object uploader must resolve the same snapshot. Bounded random writes can split or supersede chunk references. A truncate followed by extension must yield zeroes for the newly created range. Publish only a fixed generation, verify the resulting provider object and retain newer dirty generations. A wrong destination validator must preserve the local and staged data. Integrate with current moves, AppleDouble companions and recovery/export before enabling this for general mounted writes.
+4. **Recovery and housekeeping.** Persist upload IDs, pending publication receipts and durable reachability for chunks and old readers. Recover uncertain completion by checking the expected object identity. Collect unreachable staged objects only after proving ownership and recording final publication. Offline operation can accept bytes only while enough durable local storage remains. A disconnected Mac with a full physical cache needs to backpressure or decline new writes before acknowledgment.
+
+## Required qualification
+
+Use incompressible generated files through the normal mounted Finder interface. A source disk larger than the destination cache disk or an isolated volume with a fixed capacity makes the constraint reproducible. Require the finished file to exceed available local capacity, record peak allocated blocks and memory across concurrent jobs, then independently download the final ordinary object and compare SHA-256. Also measure provider requests and bytes for sequential, random and repeated writes.
+
+Reopen through a second client or a clean cache. Cover overwrites of existing remote files, holes, truncate and re-extension, AppleDouble data, packages, open readers, same-name replacement, moves during upload and remote edits by another client. Inject process loss after remote PUT, journal sync, hole punch, each publication boundary and before garbage collection. Repeat with a second writer overlapping the range selected for punching. A sparse logical-size metric or a successful direct upload alone misses the reproduced failure.
+
+No production flags, cache quotas, snapshot formats or installed binaries were changed for this investigation.

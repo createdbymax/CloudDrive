@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -70,9 +71,11 @@ def collect(go, source, backend, output):
         shutil.copy2(ROOT/'vendor/RCLONE_BUILD.json', extra/'RCLONE_BUILD.json')
         shutil.copy2(ROOT/'vendor/THIRD_PARTY_CHANGES.md', extra/'THIRD_PARTY_CHANGES.md')
         shutil.copytree(ROOT/'vendor/patches', extra/'patches')
+        version = json.loads((ROOT/'vendor/RCLONE_BUILD.json').read_text())['version']
+        link_flags = shlex.quote('-s -w -X github.com/rclone/rclone/fs.Version='+version)
         (extra/'BUILD.sh').write_text('#!/bin/sh\nset -eu\ncd "$(dirname "$0")/rclone"\n'
             'export CGO_ENABLED=0 GOTOOLCHAIN=local\n'
-            'go build -mod=vendor -trimpath -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=v1.75.2-clouddrive.1" -o ../rclone-rebuilt .\n')
+            f'go build -mod=vendor -trimpath -ldflags {link_flags} -o ../rclone-rebuilt .\n')
         (extra/'README.txt').write_text('Corresponding source for the CloudDrive rclone backend.\n'
             'Install Go 1.27.3 from go.dev, then run sh BUILD.sh. Vendored Go dependencies are included.\n'
             'RCLONE_BUILD.json pins upstream source/toolchain hashes. Patches are already applied.\n'

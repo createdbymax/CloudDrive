@@ -1,11 +1,22 @@
 import Foundation
 
+enum DirectUploadConcurrency: Int, CaseIterable, Sendable, Identifiable {
+    case one = 1, two = 2, four = 4, eight = 8
+    var id: Int { rawValue }
+    var label: String { "\(rawValue) \(self == .one ? "file" : "files")" }
+}
+
 /// Connection limits are decimal megabits/second, unlike observed transfer bytes/second.
 enum UploadLimit: Int, CaseIterable, Codable, Sendable, Identifiable {
     case unlimited = 0, mbps5 = 5, mbps10 = 10, mbps20 = 20, mbps50 = 50
     var id: Int { rawValue }
     var label: String { self == .unlimited ? "Unlimited" : "\(rawValue) Mbps" }
     var bytesPerSecond: Int64 { self == .unlimited ? -1 : Int64(rawValue) * 1_000_000 / 8 }
+    static func namespaceLabel(_ bytesPerSecond: Int64?) -> String {
+        guard let bytesPerSecond, bytesPerSecond >= 0 else { return "Unknown" }
+        if let preset = allCases.first(where: { max(0, $0.bytesPerSecond) == bytesPerSecond }) { return preset.label }
+        return "\(bytesPerSecond.formatted()) B/s"
+    }
     /// Bare rclone numbers mean KiB/s. Explicit B preserves the decimal conversion.
     var controlRate: String { self == .unlimited ? "off" : "\(bytesPerSecond)B:off" }
 }

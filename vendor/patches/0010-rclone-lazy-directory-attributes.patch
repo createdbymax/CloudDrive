@@ -1,0 +1,28 @@
+--- a/cmd/serve/nfs/allocation_unix.go
++++ b/cmd/serve/nfs/allocation_unix.go
+@@ -12,9 +12,15 @@
+ // constructing every NFS attribute response.
+ type allocatedFileInfo struct {
+ 	os.FileInfo
+-	allocation func() (uint64, error)
++	allocation          func() (uint64, error)
++	deferDirectoryAttrs bool
+ }
+ 
++// DeferDirectoryAttributes allows READDIRPLUS to return the handle and inode
++// without fetching remote metadata for every neighbor. Targeted GETATTR and
++// LOOKUP continue to use the complete size, mtime and allocation.
++func (info allocatedFileInfo) DeferDirectoryAttributes() bool { return info.deferDirectoryAttrs }
++
+ func (info allocatedFileInfo) AllocatedBytes() uint64 {
+ 	used, err := info.allocation()
+ 	if err == nil {
+@@ -30,7 +36,7 @@
+ 	if !ok || !info.Mode().IsRegular() {
+ 		return info
+ 	}
+-	return allocatedFileInfo{FileInfo: info, allocation: func() (uint64, error) {
++	return allocatedFileInfo{FileInfo: info, deferDirectoryAttrs: node.Fs().Features().SlowModTime && !node.VFS().Opt.NoModTime, allocation: func() (uint64, error) {
+ 		return node.VFS().CachedAllocatedBytes(node.CachePath())
+ 	}}
+ }

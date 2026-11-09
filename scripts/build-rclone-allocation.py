@@ -43,7 +43,8 @@ def main():
             with urllib.request.urlopen(source['url'],timeout=60) as src,archive.open('wb') as dest:shutil.copyfileobj(src,dest)
             if sha(archive)!=source['sha256']:raise RuntimeError('Source checksum mismatch: '+source['name'])
             unpack(archive,stage/source['name'])
-        for patch,base in [('0001-go-nfs-local-allocation.patch','go-nfs'),('0002-rclone-local-allocation.patch','rclone')]:
+        for patch in INFO['patches']:
+            base = 'go-nfs' if '-go-nfs-' in patch else 'rclone'
             file=ROOT/'vendor/patches'/patch
             if sha(file)!=INFO['patches'][patch]:raise RuntimeError('Patch checksum mismatch')
             subprocess.run(['/usr/bin/patch','-p1','-i',str(file)],cwd=stage/base,check=True)
@@ -51,8 +52,8 @@ def main():
         env={'PATH':str(stage/'go/bin')+':/usr/bin:/bin:/usr/sbin:/sbin','HOME':str(pathlib.Path.home()),
              'GOTOOLCHAIN':'local','GOMAXPROCS':'2','GOPATH':str(stage/'modules'),'GOCACHE':str(stage/'compile-cache'),'CGO_ENABLED':'0'}
         subprocess.run([go,'mod','edit','-replace','github.com/willscott/go-nfs=../go-nfs'],cwd=stage/'rclone',env=env,check=True)
-        subprocess.run([go,'test','-p','2','./...','-run','TestOptionalAllocatedBytes','-count=1'],cwd=stage/'go-nfs',env=env,check=True)
-        subprocess.run([go,'test','-p','2','./cmd/serve/nfs','./vfs/vfscache','-run','TestAllocation|TestAllocated','-count=1'],cwd=stage/'rclone',env=env,check=True)
+        subprocess.run([go,'test','-p','2','./...','-run','TestOptionalAllocatedBytes|TestRenameHandles|TestSetattrFailure|TestBusyMetadata|TestExclusiveAdmission|TestExclusiveReplay|TestDirectoryIdentity','-count=1'],cwd=stage/'go-nfs',env=env,check=True)
+        subprocess.run([go,'test','-p','2','./cmd/serve/nfs','./backend/s3','./vfs/vfscache','./vfs/vfscache/writeback','./vfs','-run','TestAllocation|TestAllocated|TestMetadataChanges|TestSafeMoves|TestNativeMove|TestNativeReplay|TestMoveRequest|TestPathRewriter|TestVerifiedSpill|TestCloudDriveSpill|TestCloudDriveUnlink|TestCloudDriveNewDirectoryMarker','-count=1'],cwd=stage/'rclone',env=env,check=True)
         out=ROOT/'build/backend/rclone';out.parent.mkdir(parents=True,exist_ok=True)
         subprocess.run([go,'build','-p','2','-trimpath','-ldflags','-s -w -X github.com/rclone/rclone/fs.Version='+INFO['version'],'-o',str(out),'.'],cwd=stage/'rclone',env=env,check=True)
         notices=out.parent/'backend-notices'

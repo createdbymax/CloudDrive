@@ -61,6 +61,10 @@ struct WorkerRecord: Codable, Equatable {
     var observedFS: String? = nil
     var observedCachePath: String? = nil
     var mountID: String? = nil
+    // Optional for records created by older builds. An interrupted or failed
+    // unmount can temporarily disappear from macOS mount-table snapshots.
+    var appDetachConfirmed: Bool? = nil
+    var appDetachUncertain: Bool? = nil
 
     func validate(binary: URL, destinationFingerprint: String, cachePath: String, mountPath: String, requireRunning: Bool = true) throws {
         try validateShape()
@@ -124,16 +128,18 @@ enum MountInspector {
             }
             guard actual >= 0 else { throw OwnershipError("Cannot inspect the Mac's mount table.") }
             if actual >= records.count { continue }
-            return records.prefix(Int(actual)).map { record in
-                var value = record
-                let path = withUnsafePointer(to: &value.f_mntonname) { p in p.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) } }
-                let source = withUnsafePointer(to: &value.f_mntfromname) { p in p.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) } }
-                let type = withUnsafePointer(to: &value.f_fstypename) { p in p.withMemoryRebound(to: CChar.self, capacity: 16) { String(cString: $0) } }
-                return MountEntry(path: path, source: source, type: type,
-                    id: "\(value.f_fsid.val.0):\(value.f_fsid.val.1)")
-            }
+            return records.prefix(Int(actual)).map(entry)
         }
         throw OwnershipError("Mount table changed repeatedly. Retry the operation.")
+    }
+
+    static func entry(_ record: statfs) -> MountEntry {
+        var value = record
+        let path = withUnsafePointer(to: &value.f_mntonname) { p in p.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) } }
+        let source = withUnsafePointer(to: &value.f_mntfromname) { p in p.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) } }
+        let type = withUnsafePointer(to: &value.f_fstypename) { p in p.withMemoryRebound(to: CChar.self, capacity: 16) { String(cString: $0) } }
+        return MountEntry(path: path, source: source, type: type,
+            id: "\(value.f_fsid.val.0):\(value.f_fsid.val.1)")
     }
 
     static func exactEntry(at path: String, entries: [MountEntry]) -> MountEntry? {
@@ -150,7 +156,7 @@ enum MountInspector {
     }
 }
 
-private func privateDirectory(_ url: URL) throws -> Int32 {
+func privateDirectory(_ url: URL) throws -> Int32 {
     let descriptor = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     guard descriptor >= 0 else { throw OwnershipError("Cannot open the private CloudDrive state directory.") }
     var info = stat()

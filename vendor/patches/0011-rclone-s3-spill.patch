@@ -1,0 +1,341 @@
+--- /dev/null
++++ b/backend/s3/clouddrive_spill.go
+@@ -0,0 +1,178 @@
++// CloudDrive's verified, immutable backing for released Finder cache ranges.
++package s3
++
++import (
++	"bytes"
++	"context"
++	"crypto/md5"
++	"crypto/sha256"
++	"encoding/base64"
++	"errors"
++	"fmt"
++	"io"
++	"regexp"
++	"strings"
++
++	"github.com/aws/aws-sdk-go-v2/aws"
++	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
++	smithyhttp "github.com/aws/smithy-go/transport/http"
++)
++
++const spillPartSize = 4 << 20
++const spillMetadata = "clouddrive-spill-id"
++
++var spillObjectName = regexp.MustCompile(`^([.]clouddrive-spill-[a-f0-9]{64})/[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}/([a-f0-9]{64})$`)
++
++func (f *Fs) checkSpillPrefix(prefix string) error {
++	if f.rootBucket == "" || f.rootDirectory == "" || strings.HasPrefix(f.rootDirectory, ".") ||
++		f.opt.Provider != "Cloudflare" || f.opt.VersionAt.IsSet() || f.opt.Versions || f.opt.Decompress {
++		return errors.New("CloudDrive writeback requires a dedicated R2 prefix")
++	}
++	endpoint := strings.TrimRight(f.opt.Endpoint, "/")
++	for _, base := range []string{endpoint, endpoint + "/"} {
++		expected := fmt.Sprintf(".clouddrive-spill-%x", sha256.Sum256([]byte(base+"/"+f.rootBucket+"/"+f.rootDirectory)))
++		if prefix == expected {
++			return nil
++		}
++	}
++	return errors.New("writeback namespace does not match this R2 destination")
++}
++
++func spillStatus(err error, code int) bool {
++	var response *smithyhttp.ResponseError
++	return errors.As(err, &response) && response.HTTPStatusCode() == code
++}
++
++func (f *Fs) spillGet(ctx context.Context, key string, max int64) ([]byte, error) {
++	obj, err := f.c.GetObject(ctx, &awss3.GetObjectInput{Bucket: aws.String(f.rootBucket), Key: aws.String(key)})
++	if err != nil {
++		return nil, err
++	}
++	defer obj.Body.Close()
++	if obj.ContentLength == nil || *obj.ContentLength > max || obj.Metadata[spillMetadata] != key {
++		return nil, errors.New("invalid CloudDrive writeback object identity or length")
++	}
++	data, err := io.ReadAll(io.LimitReader(obj.Body, max+1))
++	if err != nil {
++		return nil, err
++	}
++	if int64(len(data)) != *obj.ContentLength || int64(len(data)) > max {
++		return nil, errors.New("incomplete CloudDrive writeback object")
++	}
++	return data, nil
++}
++
++func (f *Fs) spillCreate(ctx context.Context, key string, data []byte) (*awss3.PutObjectOutput, error) {
++	checksum := md5.Sum(data)
++	return f.c.PutObject(ctx, &awss3.PutObjectInput{Bucket: aws.String(f.rootBucket), Key: aws.String(key),
++		IfNoneMatch: aws.String("*"), ContentLength: aws.Int64(int64(len(data))), ContentMD5: aws.String(base64.StdEncoding.EncodeToString(checksum[:])),
++		Body: bytes.NewReader(data), Metadata: map[string]string{spillMetadata: key}})
++}
++
++// InitSpillNamespace refuses a pre-existing unmarked tree. The marker also binds later
++// launches to the mount's logical destination. No regular mounted key can resolve here.
++func (f *Fs) InitSpillNamespace(ctx context.Context, prefix string) error {
++	if err := f.checkSpillPrefix(prefix); err != nil {
++		return err
++	}
++	key := prefix + "/owner-v1"
++	marker := []byte("CloudDrive spill v1\n" + f.rootBucket + "/" + f.rootDirectory + "\n")
++	check := func() error {
++		data, err := f.spillGet(ctx, key, 4096)
++		if err != nil {
++			return err
++		}
++		if !bytes.Equal(data, marker) {
++			return errors.New("CloudDrive spill namespace is already owned")
++		}
++		return nil
++	}
++	if err := check(); !spillStatus(err, 404) {
++		return err
++	}
++	result, err := f.c.ListObjectsV2(ctx, &awss3.ListObjectsV2Input{Bucket: aws.String(f.rootBucket), Prefix: aws.String(prefix), MaxKeys: aws.Int32(1)})
++	if err != nil {
++		return err
++	}
++	if len(result.Contents) > 0 {
++		return check()
++	}
++	if _, err = f.spillCreate(ctx, key, marker); err != nil {
++		if reconciled := check(); reconciled != nil {
++			return fmt.Errorf("create writeback namespace: %w", err)
++		}
++		return nil
++	}
++	return check()
++}
++
++func (f *Fs) spillDigest(key string) (string, error) {
++	groups := spillObjectName.FindStringSubmatch(key)
++	if groups == nil {
++		return "", errors.New("invalid CloudDrive spill key")
++	}
++	if err := f.checkSpillPrefix(groups[1]); err != nil {
++		return "", err
++	}
++	return groups[2], nil
++}
++
++func (f *Fs) StoreSpillChunk(ctx context.Context, key string, data []byte) error {
++	digest, err := f.spillDigest(key)
++	if err != nil {
++		return err
++	}
++	if len(data) == 0 || len(data) > spillPartSize || fmt.Sprintf("%x", sha256.Sum256(data)) != digest {
++		return errors.New("invalid CloudDrive writeback payload")
++	}
++	result, putErr := f.spillCreate(ctx, key, data)
++	// R2 validates Content-MD5 before accepting a single-part PUT. Match its independent
++	// ETag before releasing local bytes. Reconcile any other response by hashing a GET.
++	if putErr == nil && aws.ToString(result.ETag) == fmt.Sprintf("\"%x\"", md5.Sum(data)) {
++		return nil
++	}
++	if _, err = f.ReadSpillChunk(ctx, key); err != nil {
++		if putErr != nil {
++			return fmt.Errorf("store writeback chunk: %w", putErr)
++		}
++		return err
++	}
++	return nil
++}
++
++func (f *Fs) ReadSpillChunk(ctx context.Context, key string) ([]byte, error) {
++	digest, err := f.spillDigest(key)
++	if err != nil {
++		return nil, err
++	}
++	data, err := f.spillGet(ctx, key, spillPartSize)
++	if err != nil {
++		return nil, err
++	}
++	if fmt.Sprintf("%x", sha256.Sum256(data)) != digest {
++		return nil, errors.New("CloudDrive writeback checksum mismatch")
++	}
++	return data, nil
++}
++
++// R2 does not currently support If-Match on DeleteObject. Only our write-once
++// UUID/content-addressed staging keys use this path. Verify ownership and every
++// byte immediately before removal. Ordinary mounted objects never pass spillDigest.
++func (f *Fs) DeleteSpillChunk(ctx context.Context, key string) error {
++	if _, err := f.ReadSpillChunk(ctx, key); err != nil {
++		if spillStatus(err, 404) {
++			return nil
++		}
++		return err
++	}
++	prefix, _, _ := strings.Cut(key, "/")
++	marker, err := f.spillGet(ctx, prefix+"/owner-v1", 4096)
++	if err != nil {
++		return err
++	}
++	if string(marker) != "CloudDrive spill v1\n"+f.rootBucket+"/"+f.rootDirectory+"\n" {
++		return errors.New("writeback cleanup ownership changed")
++	}
++	_, err = f.c.DeleteObject(ctx, &awss3.DeleteObjectInput{Bucket: aws.String(f.rootBucket), Key: aws.String(key)})
++	return err
++}
+--- /dev/null
++++ b/backend/s3/clouddrive_spill_test.go
+@@ -0,0 +1,157 @@
++package s3
++
++import (
++	"context"
++	"crypto/md5"
++	"crypto/sha256"
++	"encoding/base64"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/aws/aws-sdk-go-v2/aws"
++	"github.com/aws/aws-sdk-go-v2/credentials"
++	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
++)
++
++func TestCloudDriveSpillProvider(t *testing.T) {
++	type object struct {
++		data []byte
++		id   string
++		etag string
++	}
++	objects := map[string]object{}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		key := strings.TrimPrefix(r.URL.Path, "/fixture/")
++		if r.URL.Query().Get("list-type") == "2" {
++			fmt.Fprint(w, "<ListBucketResult><Name>fixture</Name>")
++			for k := range objects {
++				if strings.HasPrefix(k, r.URL.Query().Get("prefix")) {
++					fmt.Fprintf(w, "<Contents><Key>%s</Key></Contents>", k)
++					break
++				}
++			}
++			fmt.Fprint(w, "</ListBucketResult>")
++			return
++		}
++		o, exists := objects[key]
++		switch r.Method {
++		case "PUT":
++			if r.Header.Get("If-None-Match") != "*" {
++				t.Error("missing exclusive create")
++			}
++			if exists {
++				w.WriteHeader(412)
++				return
++			}
++			b, _ := io.ReadAll(r.Body)
++			md := md5.Sum(b)
++			if r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(md[:]) {
++				t.Error("missing transport checksum")
++			}
++			o = object{b, r.Header.Get("x-amz-meta-clouddrive-spill-id"), fmt.Sprintf("\"%x\"", md)}
++			objects[key] = o
++			w.Header().Set("ETag", o.etag)
++		case "GET", "HEAD":
++			if !exists {
++				w.WriteHeader(404)
++				return
++			}
++			w.Header().Set("ETag", o.etag)
++			w.Header().Set("Content-Length", strconv.Itoa(len(o.data)))
++			w.Header().Set("X-Amz-Meta-Clouddrive-Spill-Id", o.id)
++			if r.Method == "GET" {
++				_, _ = w.Write(o.data)
++			}
++		case "DELETE":
++			// Mirror R2: conditional DELETE is unsupported.
++			if r.Header.Get("If-Match") != "" {
++				w.WriteHeader(http.StatusNotImplemented)
++				return
++			}
++			delete(objects, key)
++			w.WriteHeader(204)
++		default:
++			t.Errorf("unexpected method %s", r.Method)
++		}
++	}))
++	defer server.Close()
++	f := &Fs{opt: Options{Endpoint: server.URL, Provider: "Cloudflare"}, rootBucket: "fixture", rootDirectory: "personal"}
++	f.c = awss3.New(awss3.Options{Region: "auto", BaseEndpoint: aws.String(server.URL), UsePathStyle: true, Credentials: credentials.NewStaticCredentialsProvider("fixture", "fixture", "")})
++	prefix := fmt.Sprintf(".clouddrive-spill-%x", sha256.Sum256([]byte(server.URL+"/fixture/personal")))
++	ctx := context.Background()
++	if f.InitSpillNamespace(ctx, ".clouddrive-spill-"+strings.Repeat("a", 64)) == nil {
++		t.Fatal("accepted unrelated binding")
++	}
++	objects[prefix+"/foreign"] = object{}
++	if f.InitSpillNamespace(ctx, prefix) == nil {
++		t.Fatal("claimed foreign namespace")
++	}
++	delete(objects, prefix+"/foreign")
++	if e := f.InitSpillNamespace(ctx, prefix); e != nil {
++		t.Fatal(e)
++	}
++	if e := f.InitSpillNamespace(ctx, prefix); e != nil {
++		t.Fatal(e)
++	}
++	payload := []byte("verified data")
++	key := fmt.Sprintf("%s/b00b16c8-dee9-4c83-80bc-0caf23a44ab3/%x", prefix, sha256.Sum256(payload))
++	if e := f.StoreSpillChunk(ctx, key, payload); e != nil {
++		t.Fatal(e)
++	}
++	if e := f.StoreSpillChunk(ctx, key, payload); e != nil {
++		t.Fatal(e)
++	}
++	if e := f.StoreSpillChunk(ctx, key, []byte("wrong")); e == nil {
++		t.Fatal("accepted wrong source")
++	}
++	b, e := f.ReadSpillChunk(ctx, key)
++	if e != nil || string(b) != string(payload) {
++		t.Fatal(e)
++	}
++	valid := objects[key]
++	bad := valid
++	bad.data = []byte("damaged")
++	objects[key] = bad
++	if _, e = f.ReadSpillChunk(ctx, key); e == nil {
++		t.Fatal("read corrupt payload")
++	}
++	if e = f.StoreSpillChunk(ctx, key, payload); e == nil {
++		t.Fatal("reused damaged object")
++	}
++	if e = f.DeleteSpillChunk(ctx, key); e == nil || objects[key].data == nil {
++		t.Fatal("deleted a checksum-mismatched spill")
++	}
++	if e = f.DeleteSpillChunk(ctx, "ordinary"); e == nil {
++		t.Fatal("accepted ordinary key for cleanup")
++	}
++	markerKey := prefix + "/owner-v1"
++	originalMarker := objects[markerKey]
++	corruptMarker := originalMarker
++	corruptMarker.data = []byte("different owner")
++	objects[markerKey] = corruptMarker
++	objects[key] = valid
++	if e = f.DeleteSpillChunk(ctx, key); e == nil || objects[key].data == nil {
++		t.Fatal("deleted without a current verified marker")
++	}
++	objects[markerKey] = originalMarker
++	bad.id = "foreign"
++	objects[key] = bad
++	if e = f.DeleteSpillChunk(ctx, key); e == nil {
++		t.Fatal("deleted unrelated object")
++	}
++	objects[key] = valid
++	if e = f.DeleteSpillChunk(ctx, key); e != nil {
++		t.Fatal(e)
++	}
++	if e = f.DeleteSpillChunk(ctx, key); e != nil {
++		t.Fatal(e)
++	}
++	if len(objects) != 1 {
++		t.Fatal("unexpected orphan objects")
++	}
++}

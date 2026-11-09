@@ -1,0 +1,235 @@
+{
+  "scope": "Isolated Finder duplicate with concurrent cold name enumeration, 96 objects, 50 ms simulated metadata latency per request. Provider checksum after publication.",
+  "worker8": {
+    "workerSHA256": "590648fcc82fe4f442b87c411717808bfc2fcd59b40f979aba410875154e0030",
+    "metadataDelay": 0.05,
+    "neighborObjects": 96,
+    "fixtureBytes": 135266304,
+    "results": [
+      {
+        "mode": "rdirplus",
+        "seconds": 5.841,
+        "bothReturnedSeconds": 5.85,
+        "firstSystemWriteSeconds": 5.671,
+        "rpc": {
+          "Write": 520,
+          "RdirPlus": 6,
+          "Readdir": 0,
+          "Lookup": 21,
+          "Getattr": 349
+        },
+        "s3BeforeDispatch": {
+          "HEAD-other": 1,
+          "LIST": 1
+        },
+        "s3DuringCopy": {
+          "LIST": 1,
+          "HEAD-neighbor": 96
+        },
+        "s3BeforeFirstWrite": {
+          "LIST": 1,
+          "HEAD-neighbor": 96
+        },
+        "verifiedPublishedBytes": true
+      },
+      {
+        "mode": "nordirplus",
+        "seconds": 6.304,
+        "bothReturnedSeconds": 6.312,
+        "firstSystemWriteSeconds": 6.164,
+        "rpc": {
+          "Write": 520,
+          "RdirPlus": 3,
+          "Readdir": 7,
+          "Lookup": 21,
+          "Getattr": 147
+        },
+        "s3BeforeDispatch": {
+          "HEAD-other": 1,
+          "LIST": 1
+        },
+        "s3DuringCopy": {
+          "LIST": 1,
+          "HEAD-neighbor": 96
+        },
+        "s3BeforeFirstWrite": {
+          "LIST": 1,
+          "HEAD-neighbor": 96
+        },
+        "verifiedPublishedBytes": true
+      },
+      {
+        "mode": "nordirplus",
+        "seconds": 6.187,
+        "bothReturnedSeconds": 6.196,
+        "firstSystemWriteSeconds": 6.019,
+        "rpc": {
+          "Write": 520,
+          "RdirPlus": 0,
+          "Readdir": 7,
+          "Lookup": 24,
+          "Getattr": 144
+        },
+        "s3BeforeDispatch": {
+          "HEAD-other": 1,
+          "LIST": 1
+        },
+        "s3DuringCopy": {
+          "LIST": 1,
+          "HEAD-neighbor": 96
+        },
+        "s3BeforeFirstWrite": {
+          "LIST": 1,
+          "HEAD-neighbor": 96
+        },
+        "verifiedPublishedBytes": true
+      },
+      {
+        "mode": "rdirplus",
+        "seconds": 6.407,
+        "bothReturnedSeconds": 6.415,
+        "firstSystemWriteSeconds": 6.274,
+        "rpc": {
+          "Write": 520,
+          "RdirPlus": 2,
+          "Readdir": 0,
+          "Lookup": 21,
+          "Getattr": 143
+        },
+        "s3BeforeDispatch": {
+          "HEAD-other": 1,
+          "LIST": 1
+        },
+        "s3DuringCopy": {
+          "LIST": 1,
+          "HEAD-neighbor": 96
+        },
+        "s3BeforeFirstWrite": {
+          "LIST": 1,
+          "HEAD-neighbor": 96
+        },
+        "verifiedPublishedBytes": true
+      }
+    ]
+  },
+  "worker9": {
+    "workerSHA256": "72fb3c211f39d88ffe17f6f6ee7cd8adb17d88c71e389aa6cd997f3f24497b72",
+    "metadataDelay": 0.05,
+    "neighborObjects": 96,
+    "fixtureBytes": 135266304,
+    "results": [
+      {
+        "mode": "rdirplus",
+        "seconds": 0.443,
+        "bothReturnedSeconds": 0.452,
+        "firstSystemWriteSeconds": 0.273,
+        "rpc": {
+          "Write": 521,
+          "RdirPlus": 2,
+          "Readdir": 0,
+          "Lookup": 22,
+          "Getattr": 158
+        },
+        "s3BeforeDispatch": {
+          "HEAD-other": 1,
+          "LIST": 1
+        },
+        "s3DuringCopy": {
+          "LIST": 1
+        },
+        "s3BeforeFirstWrite": {
+          "LIST": 1
+        },
+        "verifiedPublishedBytes": true,
+        "coldExplicitStatPreservesRemoteMtime": true,
+        "copiedFilePreservesMtime": true,
+        "copiedFinderTagAndCloudAppleDouble": true,
+        "ordinaryNestedFolderPublished": true
+      },
+      {
+        "mode": "nordirplus",
+        "seconds": 0.447,
+        "bothReturnedSeconds": 0.456,
+        "firstSystemWriteSeconds": 0.279,
+        "rpc": {
+          "Write": 521,
+          "RdirPlus": 0,
+          "Readdir": 7,
+          "Lookup": 20,
+          "Getattr": 156
+        },
+        "s3BeforeDispatch": {
+          "HEAD-other": 1,
+          "LIST": 1
+        },
+        "s3DuringCopy": {
+          "LIST": 1
+        },
+        "s3BeforeFirstWrite": {
+          "LIST": 1
+        },
+        "verifiedPublishedBytes": true,
+        "coldExplicitStatPreservesRemoteMtime": true,
+        "copiedFilePreservesMtime": true,
+        "copiedFinderTagAndCloudAppleDouble": true,
+        "ordinaryNestedFolderPublished": true
+      },
+      {
+        "mode": "nordirplus",
+        "seconds": 0.446,
+        "bothReturnedSeconds": 0.455,
+        "firstSystemWriteSeconds": 0.275,
+        "rpc": {
+          "Write": 521,
+          "RdirPlus": 0,
+          "Readdir": 7,
+          "Lookup": 20,
+          "Getattr": 159
+        },
+        "s3BeforeDispatch": {
+          "HEAD-other": 1,
+          "LIST": 1
+        },
+        "s3DuringCopy": {
+          "LIST": 1
+        },
+        "s3BeforeFirstWrite": {
+          "LIST": 1
+        },
+        "verifiedPublishedBytes": true,
+        "coldExplicitStatPreservesRemoteMtime": true,
+        "copiedFilePreservesMtime": true,
+        "copiedFinderTagAndCloudAppleDouble": true,
+        "ordinaryNestedFolderPublished": true
+      },
+      {
+        "mode": "rdirplus",
+        "seconds": 0.457,
+        "bothReturnedSeconds": 0.466,
+        "firstSystemWriteSeconds": 0.28,
+        "rpc": {
+          "Write": 521,
+          "RdirPlus": 3,
+          "Readdir": 0,
+          "Lookup": 66,
+          "Getattr": 154
+        },
+        "s3BeforeDispatch": {
+          "HEAD-other": 1,
+          "LIST": 1
+        },
+        "s3DuringCopy": {
+          "LIST": 1
+        },
+        "s3BeforeFirstWrite": {
+          "LIST": 1
+        },
+        "verifiedPublishedBytes": true,
+        "coldExplicitStatPreservesRemoteMtime": true,
+        "copiedFilePreservesMtime": true,
+        "copiedFinderTagAndCloudAppleDouble": true,
+        "ordinaryNestedFolderPublished": true
+      }
+    ]
+  }
+}

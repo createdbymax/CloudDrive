@@ -1,0 +1,714 @@
+--- /dev/null
++++ b/busy_lookup_test.go
+@@ -0,0 +1,104 @@
++package nfs
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"github.com/go-git/go-billy/v5"
++	"github.com/go-git/go-billy/v5/memfs"
++	"github.com/willscott/go-nfs-client/nfs/xdr"
++	"os"
++	"syscall"
++	"testing"
++)
++
++type busyMetadataFS struct{ billy.Filesystem }
++
++func (f busyMetadataFS) Lstat(name string) (os.FileInfo, error) {
++	if name == "busy" {
++		return nil, syscall.EBUSY
++	}
++	return f.Filesystem.Lstat(name)
++}
++
++type busyMetadataHandler struct {
++	Handler
++	fs   billy.Filesystem
++	path []string
++}
++
++func (h busyMetadataHandler) FromHandle([]byte) (billy.Filesystem, []string, error) {
++	return h.fs, h.path, nil
++}
++func TestBusyMetadataIsRetryable(t *testing.T) {
++	f := busyMetadataFS{memfs.New()}
++	for _, parent := range []string{"", "busy"} {
++		b := bytes.NewBuffer(nil)
++		if err := xdr.Write(b, DirOpArg{Handle: []byte("root"), Filename: []byte("busy")}); err != nil {
++			t.Fatal(err)
++		}
++		p := []string{}
++		if parent != "" {
++			p = []string{parent}
++		}
++		err := onLookup(context.Background(), &response{req: &request{Body: b}}, busyMetadataHandler{fs: f, path: p})
++		var status *NFSStatusError
++		if !errors.As(err, &status) || status.NFSStatus != NFSStatusJukebox || !errors.Is(err, syscall.EBUSY) {
++			t.Fatalf("LOOKUP must retry, got %v", err)
++		}
++	}
++	b := bytes.NewBuffer(nil)
++	if err := xdr.Write(b, []byte("handle")); err != nil {
++		t.Fatal(err)
++	}
++	err := onGetAttr(context.Background(), &response{req: &request{Body: b}}, busyMetadataHandler{fs: f, path: []string{"busy"}})
++	var status *NFSStatusError
++	if !errors.As(err, &status) || status.NFSStatus != NFSStatusJukebox {
++		t.Fatalf("GETATTR must retry, got %v", err)
++	}
++}
++
++type failedMetadataFS struct{ billy.Filesystem }
++
++func (f failedMetadataFS) Lstat(name string) (os.FileInfo, error) {
++	if name == "failed" {
++		return nil, syscall.EIO
++	}
++	return f.Filesystem.Lstat(name)
++}
++func (f failedMetadataFS) ReadDir(name string) ([]os.FileInfo, error) {
++	if name == "failed" {
++		return nil, syscall.EIO
++	}
++	return f.Filesystem.ReadDir(name)
++}
++
++func TestBusyMetadataRecoveryFailureIsTerminalIO(t *testing.T) {
++	f := failedMetadataFS{memfs.New()}
++	check := func(operation string, err error) {
++		t.Helper()
++		var status *NFSStatusError
++		if !errors.As(err, &status) || status.NFSStatus != NFSStatusIO || !errors.Is(err, syscall.EIO) {
++			t.Fatalf("%s must report terminal IO instead of retrying or missing path: %v", operation, err)
++		}
++	}
++	for _, parent := range []string{"", "failed"} {
++		body := bytes.NewBuffer(nil)
++		if err := xdr.Write(body, DirOpArg{Handle: []byte("root"), Filename: []byte("failed")}); err != nil {
++			t.Fatal(err)
++		}
++		var path []string
++		if parent != "" {
++			path = []string{parent}
++		}
++		check("LOOKUP", onLookup(context.Background(), &response{req: &request{Body: body}}, busyMetadataHandler{fs: f, path: path}))
++	}
++	body := bytes.NewBuffer(nil)
++	if err := xdr.Write(body, []byte("handle")); err != nil {
++		t.Fatal(err)
++	}
++	handler := busyMetadataHandler{fs: f, path: []string{"failed"}}
++	check("GETATTR", onGetAttr(context.Background(), &response{req: &request{Body: body}}, handler))
++	_, _, err := getDirListingWithVerifier(handler, []byte("handle"), 0)
++	check("READDIR", err)
++}
+--- a/conn.go
++++ b/conn.go
+@@ -1,3 +1,4 @@
++// Modified for CloudDrive (2026-11-04): rename identity, request leases and write cleanup.
+ package nfs
+ 
+ import (
+@@ -9,6 +10,7 @@
+ 	"fmt"
+ 	"io"
+ 	"net"
++	"syscall"
+ 
+ 	xdr2 "github.com/rasky/go-xdr/xdr2"
+ 	"github.com/willscott/go-nfs-client/nfs/rpc"
+@@ -122,7 +124,18 @@
+ 		}
+ 		return c.err(ctx, w, &ResponseCodeProcUnavailableError{})
+ 	}
++	if w.req.Header.Prog == nfsServiceID {
++		if h, ok := c.Server.Handler.(RequestHandler); ok {
++			release := h.BeginRequest(NFSProcedure(w.req.Header.Proc))
++			defer release()
++		}
++	}
+ 	appError := handler(ctx, w, c.Server.Handler)
++	if errors.Is(appError, syscall.EBUSY) {
++		appError = &NFSStatusError{NFSStatusJukebox, syscall.EBUSY}
++	} else if errors.Is(appError, syscall.EIO) {
++		appError = &NFSStatusError{NFSStatusIO, syscall.EIO}
++	}
+ 	if drainErr := w.drain(ctx); drainErr != nil {
+ 		return drainErr
+ 	}
+--- a/file.go
++++ b/file.go
+@@ -1,4 +1,4 @@
+-// Modified for CloudDrive (2026-11-03): optional local-allocation attributes.
++// Modified for CloudDrive (2026-11-04): allocation attributes and SETATTR cleanup.
+ package nfs
+ 
+ import (
+@@ -255,19 +255,24 @@
+ 		if curr.Mode()&os.ModeSymlink != 0 {
+ 			return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
+ 		}
+-		fp, err := fs.OpenFile(file, os.O_WRONLY|os.O_EXCL, 0)
+-		if errors.Is(err, os.ErrPermission) {
+-			return &NFSStatusError{NFSStatusAccess, err}
+-		} else if err != nil {
+-			return err
+-		}
+-		if *s.SetSize > math.MaxInt64 {
+-			return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+-		}
+-		if err := fp.Truncate(int64(*s.SetSize)); err != nil {
+-			return err
+-		}
+-		if err := fp.Close(); err != nil {
++		err := func() (result error) {
++			fp, err := fs.OpenFile(file, os.O_WRONLY|os.O_EXCL, 0)
++			if errors.Is(err, os.ErrPermission) {
++				return &NFSStatusError{NFSStatusAccess, err}
++			} else if err != nil {
++				return err
++			}
++			defer func() {
++				if closeErr := fp.Close(); result == nil {
++					result = closeErr
++				}
++			}()
++			if *s.SetSize > math.MaxInt64 {
++				return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
++			}
++			return fp.Truncate(int64(*s.SetSize))
++		}()
++		if err != nil {
+ 			return err
+ 		}
+ 	}
+--- a/handler.go
++++ b/handler.go
+@@ -1,3 +1,4 @@
++// Modified for CloudDrive (2026-11-04): rename identity, request leases and write cleanup.
+ package nfs
+ 
+ import (
+@@ -50,3 +51,15 @@
+ 	// fs.FileInfo needs to be sorted by Name(), nil in case of a cache-miss
+ 	DataForVerifier(path string, verifier uint64) []fs.FileInfo
+ }
++
++// RenameHandler optionally preserves file handles after a successful rename.
++// The callback receives root-relative path components on the same filesystem.
++type RenameHandler interface {
++	RenameHandles(billy.Filesystem, []string, []string) error
++}
++
++// RequestHandler optionally protects handle resolution through filesystem execution.
++// release must be called after the request handler returns.
++type RequestHandler interface {
++	BeginRequest(procedure NFSProcedure) (release func())
++}
+--- a/helpers/cachinghandler.go
++++ b/helpers/cachinghandler.go
+@@ -1,3 +1,4 @@
++// Modified for CloudDrive (2026-11-04): rename identity, request leases and write cleanup.
+ package helpers
+ 
+ import (
+@@ -38,11 +39,11 @@
+ // CachingHandler implements to/from handle via an LRU cache.
+ type CachingHandler struct {
+ 	nfs.Handler
+-	activeHandles    *lru.Cache[uuid.UUID, entry]
+-	reverseHandles   map[string][]uuid.UUID
+-	reverseHandlesMu sync.RWMutex
+-	activeVerifiers  *lru.Cache[uint64, verifier]
+-	cacheLimit       int
++	activeHandles   *lru.Cache[uuid.UUID, entry]
++	reverseHandles  map[string][]uuid.UUID
++	stateMu         sync.Mutex
++	activeVerifiers *lru.Cache[uint64, verifier]
++	cacheLimit      int
+ }
+ 
+ type entry struct {
+@@ -54,6 +55,8 @@
+ // In stateless nfs (when it's serving a unix fs) this can be the device + inode
+ // but we can generalize with a stateful local cache of handed out IDs.
+ func (c *CachingHandler) ToHandle(f billy.Filesystem, path []string) []byte {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
+ 	joinedPath := f.Join(path...)
+ 
+ 	if handle := c.searchReverseCache(f, joinedPath); handle != nil {
+@@ -79,16 +82,21 @@
+ 
+ // FromHandle converts from an opaque handle to the file it represents
+ func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
+ 	id, err := uuid.FromBytes(fh)
+ 	if err != nil {
+ 		return nil, []string{}, err
+ 	}
+ 
+ 	if f, ok := c.activeHandles.Get(id); ok {
+-		for _, k := range c.activeHandles.Keys() {
+-			candidate, _ := c.activeHandles.Peek(k)
+-			if hasPrefix(f.p, candidate.p) {
+-				_, _ = c.activeHandles.Get(k)
++		// Touch only cached ancestors; scanning every handle makes each
++		// metadata request proportional to the entire mounted tree.
++		for i := 0; i < len(f.p); i++ {
++			for _, k := range c.reverseHandles[f.f.Join(f.p[:i]...)] {
++				if candidate, found := c.activeHandles.Peek(k); found && sameFilesystem(candidate.f, f.f) {
++					c.activeHandles.Get(k)
++				}
+ 			}
+ 		}
+ 		if ok {
+@@ -105,7 +113,7 @@
+ 
+ 	for _, id := range uuids {
+ 		if candidate, ok := c.activeHandles.Get(id); ok {
+-			if reflect.DeepEqual(candidate.f, f) {
++			if sameFilesystem(candidate.f, f) {
+ 				return id[:]
+ 			}
+ 		}
+@@ -115,8 +123,6 @@
+ }
+ 
+ func (c *CachingHandler) evictReverseCache(path string, handle uuid.UUID) {
+-	c.reverseHandlesMu.Lock()
+-	defer c.reverseHandlesMu.Unlock()
+ 
+ 	uuids, ok := c.reverseHandles[path]
+ 	if !ok {
+@@ -125,24 +131,25 @@
+ 	for i, u := range uuids {
+ 		if u == handle {
+ 			c.reverseHandles[path] = append(uuids[:i], uuids[i+1:]...)
++			if len(c.reverseHandles[path]) == 0 {
++				delete(c.reverseHandles, path)
++			}
+ 			return
+ 		}
+ 	}
+ }
+ 
+ func (c *CachingHandler) getReverseHandles(path string) []uuid.UUID {
+-	c.reverseHandlesMu.RLock()
+-	defer c.reverseHandlesMu.RUnlock()
+ 	return c.reverseHandles[path]
+ }
+ 
+ func (c *CachingHandler) appendReverseHandle(path string, id uuid.UUID) {
+-	c.reverseHandlesMu.Lock()
+-	defer c.reverseHandlesMu.Unlock()
+ 	c.reverseHandles[path] = append(c.reverseHandles[path], id)
+ }
+ 
+ func (c *CachingHandler) InvalidateHandle(fs billy.Filesystem, handle []byte) error {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
+ 	//Remove from cache
+ 	id, _ := uuid.FromBytes(handle)
+ 	entry, ok := c.activeHandles.Get(id)
+@@ -193,14 +200,56 @@
+ }
+ 
+ func (c *CachingHandler) VerifierFor(path string, contents []fs.FileInfo) uint64 {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
+ 	id := hashPathAndContents(path, contents)
+ 	c.activeVerifiers.Add(id, verifier{path, contents})
+ 	return id
+ }
+ 
+ func (c *CachingHandler) DataForVerifier(path string, id uint64) []fs.FileInfo {
+-	if cache, ok := c.activeVerifiers.Get(id); ok {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
++	if cache, ok := c.activeVerifiers.Get(id); ok && cache.path == path {
+ 		return cache.contents
+ 	}
+ 	return nil
+ }
++
++// sameFilesystem compares identity, never the mutable contents of a filesystem.
++func sameFilesystem(a, b billy.Filesystem) bool {
++	return reflect.TypeOf(a) == reflect.TypeOf(b) && reflect.TypeOf(a) != nil && reflect.TypeOf(a).Comparable() && a == b
++}
++
++// RenameHandles preserves object identities and rebases cached descendant paths.
++// Handles for replaced destination objects become stale rather than aliasing the source.
++func (c *CachingHandler) RenameHandles(f billy.Filesystem, oldPath, newPath []string) error {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
++	if f.Join(oldPath...) == f.Join(newPath...) {
++		return nil
++	}
++	keys := c.activeHandles.Keys()
++	for _, id := range keys {
++		e, ok := c.activeHandles.Peek(id)
++		if !ok || !sameFilesystem(e.f, f) {
++			continue
++		}
++		if hasPrefix(e.p, newPath) && !hasPrefix(e.p, oldPath) {
++			c.evictReverseCache(f.Join(e.p...), id)
++			c.activeHandles.Remove(id)
++		}
++	}
++	for _, id := range keys {
++		e, ok := c.activeHandles.Peek(id)
++		if !ok || !sameFilesystem(e.f, f) || !hasPrefix(e.p, oldPath) {
++			continue
++		}
++		c.evictReverseCache(f.Join(e.p...), id)
++		p := append(append([]string{}, newPath...), e.p[len(oldPath):]...)
++		c.activeHandles.Add(id, entry{e.f, p})
++		c.appendReverseHandle(f.Join(p...), id)
++	}
++	c.activeVerifiers.Purge()
++	return nil
++}
+--- /dev/null
++++ b/helpers/rename_test.go
+@@ -0,0 +1,76 @@
++package helpers
++
++import (
++	"bytes"
++	"github.com/go-git/go-billy/v5"
++	"github.com/go-git/go-billy/v5/memfs"
++	"sync"
++	"testing"
++)
++
++type renameHandler interface {
++	RenameHandles(billy.Filesystem, []string, []string) error
++}
++
++func TestRenameHandles(t *testing.T) {
++	f := memfs.New()
++	c := NewCachingHandler(nil, 100).(*CachingHandler)
++	source := c.ToHandle(f, []string{"Album"})
++	child := c.ToHandle(f, []string{"Album", "Sub", "Résumé.wav"})
++	sibling := c.ToHandle(f, []string{"Album2", "keep.wav"})
++	overwritten := c.ToHandle(f, []string{"Destination", "Album"})
++	unrelatedFS := memfs.New()
++	other := c.ToHandle(unrelatedFS, []string{"Album", "keep"})
++	h, ok := any(c).(renameHandler)
++	if !ok {
++		t.Fatal("handler cannot preserve handles across rename")
++	}
++	if err := h.RenameHandles(f, []string{"Album"}, []string{"Destination", "Album"}); err != nil {
++		t.Fatal(err)
++	}
++	check := func(handle []byte, want string) {
++		t.Helper()
++		_, p, err := c.FromHandle(handle)
++		if err != nil || f.Join(p...) != want {
++			t.Fatalf("got %v %v, want %s", p, err, want)
++		}
++	}
++	check(source, "Destination/Album")
++	check(child, "Destination/Album/Sub/Résumé.wav")
++	check(sibling, "Album2/keep.wav")
++	check(other, "Album/keep")
++	if _, _, err := c.FromHandle(overwritten); err == nil {
++		t.Fatal("replacement target handle was rebound to another object")
++	}
++	if !bytes.Equal(child, c.ToHandle(f, []string{"Destination", "Album", "Sub", "Résumé.wav"})) {
++		t.Fatal("lookup changed object identity")
++	}
++	if err := h.RenameHandles(f, []string{"Destination", "Album"}, []string{"Destination", "Album"}); err != nil {
++		t.Fatal(err)
++	}
++	check(child, "Destination/Album/Sub/Résumé.wav")
++}
++
++func TestRenameHandlesConcurrent(t *testing.T) {
++	f := memfs.New()
++	c := NewCachingHandler(nil, 64).(*CachingHandler)
++	h, ok := any(c).(renameHandler)
++	if !ok {
++		t.Fatal("rename hook missing")
++	}
++	var wg sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for j := 0; j < 200; j++ {
++				b := c.ToHandle(f, []string{"A", "child"})
++				c.FromHandle(b)
++				h.RenameHandles(f, []string{"A"}, []string{"B"})
++				h.RenameHandles(f, []string{"B"}, []string{"A"})
++				c.InvalidateHandle(f, b)
++			}
++		}()
++	}
++	wg.Wait()
++}
+--- a/nfs_ongetattr.go
++++ b/nfs_ongetattr.go
+@@ -1,9 +1,12 @@
++// Modified for CloudDrive (2026-11-04): preserve retryable metadata errors.
+ package nfs
+ 
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"os"
++	"syscall"
+ 
+ 	"github.com/willscott/go-nfs-client/nfs/xdr"
+ )
+@@ -21,6 +24,9 @@
+ 
+ 	fullPath := fs.Join(path...)
+ 	info, err := fs.Lstat(fullPath)
++	if errors.Is(err, syscall.EBUSY) {
++		return &NFSStatusError{NFSStatusJukebox, err}
++	}
+ 	if err != nil {
+ 		if os.IsNotExist(err) {
+ 			return &NFSStatusError{NFSStatusNoEnt, err}
+--- a/nfs_onlookup.go
++++ b/nfs_onlookup.go
+@@ -1,9 +1,12 @@
++// Modified for CloudDrive (2026-11-04): preserve retryable metadata errors.
+ package nfs
+ 
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"os"
++	"syscall"
+ 
+ 	"github.com/go-git/go-billy/v5"
+ 	"github.com/willscott/go-nfs-client/nfs/xdr"
+@@ -39,6 +42,12 @@
+ 		return &NFSStatusError{NFSStatusStale, err}
+ 	}
+ 	dirInfo, err := fs.Lstat(fs.Join(p...))
++	if errors.Is(err, syscall.EBUSY) {
++		return &NFSStatusError{NFSStatusJukebox, err}
++	}
++	if errors.Is(err, syscall.EIO) {
++		return &NFSStatusError{NFSStatusIO, err}
++	}
+ 	if err != nil || !dirInfo.IsDir() {
+ 		return &NFSStatusError{NFSStatusNotDir, err}
+ 	}
+@@ -72,6 +81,12 @@
+ 
+ 	reqPath := append(p, string(obj.Filename))
+ 	if _, err = fs.Lstat(fs.Join(reqPath...)); err != nil {
++		if errors.Is(err, syscall.EBUSY) {
++			return &NFSStatusError{NFSStatusJukebox, err}
++		}
++		if errors.Is(err, syscall.EIO) {
++			return &NFSStatusError{NFSStatusIO, err}
++		}
+ 		return &NFSStatusError{NFSStatusNoEnt, os.ErrNotExist}
+ 	}
+ 
+--- a/nfs_onreaddir.go
++++ b/nfs_onreaddir.go
+@@ -5,11 +5,13 @@
+ 	"context"
+ 	"crypto/sha256"
+ 	"encoding/binary"
++	"errors"
+ 	"io"
+ 	"io/fs"
+ 	"os"
+ 	"path"
+ 	"sort"
++	"syscall"
+ 
+ 	"github.com/willscott/go-nfs-client/nfs/xdr"
+ )
+@@ -155,6 +157,9 @@
+ 	// load the entries.
+ 	contents, err := fs.ReadDir(path)
+ 	if err != nil {
++		if errors.Is(err, syscall.EIO) {
++			return nil, 0, &NFSStatusError{NFSStatusIO, err}
++		}
+ 		if os.IsPermission(err) {
+ 			return nil, 0, &NFSStatusError{NFSStatusAccess, err}
+ 		}
+--- a/nfs_onrename.go
++++ b/nfs_onrename.go
+@@ -1,10 +1,14 @@
++// Modified for CloudDrive (2026-11-04): rename identity, request leases and write cleanup.
+ package nfs
+ 
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
++	"fmt"
+ 	"os"
+ 	"reflect"
++	"syscall"
+ 
+ 	"github.com/go-git/go-billy/v5"
+ 	"github.com/willscott/go-nfs-client/nfs/xdr"
+@@ -71,13 +75,36 @@
+ 	}
+ 	preDestData := ToFileAttribute(toDirInfo, toDirPath).AsCache()
+ 
+-	oldHandle := userHandle.ToHandle(fs, append(fromPath, string(from.Filename)))
++	fromFull := append(append([]string{}, fromPath...), string(from.Filename))
++	toFull := append(append([]string{}, toPath...), string(to.Filename))
++	var oldHandle []byte
++	if _, ok := userHandle.(RenameHandler); !ok {
++		oldHandle = userHandle.ToHandle(fs, fromFull)
++	}
+ 
+-	fromLoc := fs.Join(append(fromPath, string(from.Filename))...)
+-	toLoc := fs.Join(append(toPath, string(to.Filename))...)
++	fromLoc := fs.Join(fromFull...)
++	toLoc := fs.Join(toFull...)
+ 
+-	err = fs.Rename(fromLoc, toLoc)
++	if native, ok := fs.(interface {
++		RenameRequest(string, string, string) error
++	}); ok {
++		err = native.RenameRequest(fromLoc, toLoc, fmt.Sprintf("%p:%08x", w.conn, w.req.xid))
++	} else {
++		err = fs.Rename(fromLoc, toLoc)
++	}
+ 	if err != nil {
++		switch {
++		case errors.Is(err, syscall.ENOTEMPTY):
++			return &NFSStatusError{NFSStatusNotEmpty, err}
++		case errors.Is(err, syscall.EINVAL), errors.Is(err, os.ErrInvalid):
++			return &NFSStatusError{NFSStatusInval, err}
++		case errors.Is(err, syscall.EISDIR):
++			return &NFSStatusError{NFSStatusIsDir, err}
++		case errors.Is(err, syscall.ENOTDIR):
++			return &NFSStatusError{NFSStatusNotDir, err}
++		case errors.Is(err, syscall.EBUSY):
++			return &NFSStatusError{NFSStatusJukebox, err}
++		}
+ 		if os.IsNotExist(err) {
+ 			return &NFSStatusError{NFSStatusNoEnt, err}
+ 		}
+@@ -87,8 +114,15 @@
+ 		return &NFSStatusError{NFSStatusIO, err}
+ 	}
+ 
+-	if err := userHandle.InvalidateHandle(fs, oldHandle); err != nil {
+-		return &NFSStatusError{NFSStatusServerFault, err}
++	var handleErr error
++	if managed, ok := fs.(interface{ RenameManagesHandles() bool }); ok && managed.RenameManagesHandles() {
++	} else if h, ok := userHandle.(RenameHandler); ok {
++		handleErr = h.RenameHandles(fs, fromFull, toFull)
++	} else {
++		handleErr = userHandle.InvalidateHandle(fs, oldHandle)
++	}
++	if handleErr != nil {
++		return &NFSStatusError{NFSStatusServerFault, handleErr}
+ 	}
+ 
+ 	writer := bytes.NewBuffer([]byte{})
+--- a/nfs_onwrite.go
++++ b/nfs_onwrite.go
+@@ -1,3 +1,4 @@
++// Modified for CloudDrive (2026-11-04): rename identity, request leases and write cleanup.
+ package nfs
+ 
+ import (
+@@ -68,6 +69,7 @@
+ 	if err != nil {
+ 		return &NFSStatusError{NFSStatusAccess, err}
+ 	}
++	defer file.Close()
+ 	if req.Offset > 0 {
+ 		if _, err := file.Seek(int64(req.Offset), io.SeekStart); err != nil {
+ 			return &NFSStatusError{NFSStatusIO, err}
+--- /dev/null
++++ b/setattr_lease_test.go
+@@ -0,0 +1,74 @@
++package nfs
++
++import (
++	"errors"
++	"github.com/go-git/go-billy/v5"
++	"github.com/go-git/go-billy/v5/memfs"
++	"math"
++	"os"
++	"sync"
++	"testing"
++)
++
++type truncateLeaseFS struct {
++	billy.Filesystem
++	gate   sync.RWMutex
++	closes int
++	opens  int
++}
++type truncateLeaseFile struct {
++	billy.File
++	owner  *truncateLeaseFS
++	closed bool
++}
++
++func (f *truncateLeaseFS) OpenFile(name string, flags int, perm os.FileMode) (billy.File, error) {
++	f.gate.RLock()
++	fp, err := f.Filesystem.OpenFile(name, flags&^os.O_EXCL, perm)
++	if err != nil {
++		f.gate.RUnlock()
++		return nil, err
++	}
++	f.opens++
++	return &truncateLeaseFile{File: fp, owner: f}, nil
++}
++func (f *truncateLeaseFile) Truncate(size int64) error {
++	return errors.New("injected truncate failure")
++}
++func (f *truncateLeaseFile) Close() error {
++	if !f.closed {
++		f.closed = true
++		f.owner.closes++
++		defer f.owner.gate.RUnlock()
++		return f.File.Close()
++	}
++	return nil
++}
++func TestSetattrFailureReleasesMutationLease(t *testing.T) {
++	for _, size := range []uint64{2, math.MaxUint64} {
++		f := &truncateLeaseFS{Filesystem: memfs.New()}
++		fp, err := f.Filesystem.Create("source")
++		if err != nil {
++			t.Fatal(err)
++		}
++		fp.Close()
++		attrs := SetFileAttributes{SetSize: &size}
++		if err = attrs.Apply(nil, f, "source"); err == nil {
++			t.Fatal("expected SETATTR failure")
++		}
++		if f.opens != 1 {
++			t.Fatalf("fixture failed to open truncation handle: %d opens", f.opens)
++		}
++		if f.closes != 1 {
++			t.Fatalf("SETATTR leaked mutation handle: %d closes", f.closes)
++		}
++		if !f.gate.TryLock() {
++			t.Fatal("subsequent rename would deadlock")
++		}
++		err = f.Filesystem.Rename("source", "destination")
++		f.gate.Unlock()
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++}

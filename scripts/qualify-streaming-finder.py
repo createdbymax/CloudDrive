@@ -140,7 +140,7 @@ def main():
         fd = os.open(root/'fixture-control.json', os.O_CREAT|os.O_EXCL|os.O_WRONLY, 0o600)
         with os.fdopen(fd, 'w') as handle: json.dump({'enginePID': engine.pid, 's3PID': server.pid, 'controlPort': control, 'token': token, 'nfsPort': nfs}, handle)
         local.until(lambda: request('status'), seconds=10)
-        local.command(['/sbin/mount_nfs', '-o', f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,nodev,nosuid,acregmin=0,acregmax=1,rsize=1048576,wsize=1048576', '127.0.0.1:/', str(mount)])
+        local.command(['/sbin/mount_nfs', '-o', f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,mutejukebox,nodev,nosuid,acregmin=0,acregmax=1,rsize=1048576,wsize=1048576', '127.0.0.1:/', str(mount)])
         assert local.is_mounted(mount)
         ready_at = time.monotonic()
         print(json.dumps({'source': str(payload), 'destination': str(mount), 'ack': str(ack), 'deadlineSeconds': 180, 'sizeBytes': size}), flush=True)

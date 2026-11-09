@@ -77,7 +77,7 @@ def main():
         local.until(control);selected_fs=control()['fs'];assert selected_fs.startswith('fixture') and selected_fs.endswith(':bucket')
         cache_root=pathlib.Path(control()['diskCache']['path']);assert cache in cache_root.parents
         low=cap(8);passed.append('8 Mbps converts exactly to 1000000 bytes/s transmit, unlimited receive')
-        local.command(['/sbin/mount_nfs','-o',f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,nodev,nosuid','127.0.0.1:/',str(mount)])
+        local.command(['/sbin/mount_nfs','-o',f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,mutejukebox,nodev,nosuid','127.0.0.1:/',str(mount)])
         copy('upload.bin');local.until(lambda:item('upload.bin') and item('upload.bin')['uploading'])
         time.sleep(1);slow=sample('upload.bin');measurements['8Mbps_observed_bytes_per_second']=round(slow)
         assert .65*1_000_000<slow<1.35*1_000_000,slow

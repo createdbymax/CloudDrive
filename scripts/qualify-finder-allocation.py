@@ -120,7 +120,7 @@ print(String(data:data,encoding:.utf8)!)
     def mount_fixture():
         assert not local.is_mounted(mount)
         local.command(['/sbin/mount_nfs','-o',
-            f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,nodev,nosuid,acregmin=0,acregmax=1',
+            f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,mutejukebox,nodev,nosuid,acregmin=0,acregmax=1',
             '127.0.0.1:/',str(mount)])
         assert local.is_mounted(mount)
 

@@ -71,7 +71,7 @@ def main():
         assert stats()['fs'].rstrip('/') == str(backend)
         cache_root = pathlib.Path(stats()['diskCache']['path'])
         assert root/'cache' in cache_root.parents
-        local.command(['/sbin/mount_nfs', '-o', f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,nodev,nosuid,acregmin=0,acregmax=1', '127.0.0.1:/', str(mount)])
+        local.command(['/sbin/mount_nfs', '-o', f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,mutejukebox,nodev,nosuid,acregmin=0,acregmax=1', '127.0.0.1:/', str(mount)])
         print(json.dumps({'source': str(payload), 'destination': str(mount), 'ack': str(root/'ack-finder-done'), 'deadlineSeconds': 180}), flush=True)
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:

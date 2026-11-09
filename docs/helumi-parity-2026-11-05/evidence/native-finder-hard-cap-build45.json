@@ -1,0 +1,15 @@
+{
+  "success": true,
+  "appBuild": "45",
+  "payloadBytes": 234881024,
+  "hardCapacityBytes": 167731200,
+  "initialAvailableBytes": 166268928,
+  "peakVolumeUseBytes": 49446912,
+  "finderSeconds": 27.946,
+  "verifiedSeconds": 86.762,
+  "r2SHA256": "b354e96a06e8c1f55c3a4d95d40e6a07222aa67cbe7677d821e4bf0e6f0d0693",
+  "sourceSHA256": "b354e96a06e8c1f55c3a4d95d40e6a07222aa67cbe7677d821e4bf0e6f0d0693",
+  "generatedKeysRemoved": 35,
+  "remainingKeys": 0,
+  "cacheDetached": true
+}

@@ -1,0 +1,223 @@
+--- a/vfs/file.go
++++ b/vfs/file.go
+@@ -10,6 +10,7 @@
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
++	"syscall"
+ 	"time"
+ 
+ 	"slices"
+@@ -708,28 +709,38 @@
+ 		return EROFS
+ 	}
+ 
+-	// Remove the object from the cache
+-	wasWriting := false
+-	if d.vfs.cache != nil && d.vfs.cache.Exists(f.CachePath()) {
+-		wasWriting = d.vfs.cache.Remove(f.CachePath())
+-	}
+-
+-	f.muRW.Lock() // muRW must be locked before mu to avoid
+-	f.mu.Lock()   // deadlock in RWFileHandle.openPending and .close
+-	if f.o != nil {
+-		err = f.o.Remove(f.ctx)
+-	}
+-	f.mu.Unlock()
++	// Serialize with RW handle open/close so a close cannot enqueue a transfer
++	// between checking publication and discarding the cache.
++	f.muRW.Lock()
++	f.mu.RLock()
++	remote := f.o
++	writing := len(f.writers) != 0
++	f.mu.RUnlock()
++	if d.vfs.cache != nil {
++		if writing {
++			f.muRW.Unlock()
++			return syscall.EBUSY
++		}
++		cached, ready := d.vfs.cache.PrepareUnlink(changedPath, remote != nil)
++		if !ready {
++			f.muRW.Unlock()
++			return syscall.EBUSY
++		}
++		if remote == nil {
++			remote = cached
++		}
++	}
++
++	if remote != nil {
++		err = remote.Remove(f.ctx)
++	}
++	if errors.Is(err, fs.ErrorObjectNotFound) {
++		err = nil
++	}
++	if err == nil && d.vfs.cache != nil {
++		d.vfs.cache.Remove(changedPath)
++	}
+ 	f.muRW.Unlock()
+-	if err != nil {
+-		if wasWriting {
+-			// Ignore error deleting file if was writing it as it may not be uploaded yet
+-			err = nil
+-			fs.Debugf(f._path(), "Ignoring File.Remove file error as uploading: %v", err)
+-		} else {
+-			fs.Debugf(f._path(), "File.Remove file error: %v", err)
+-		}
+-	}
+ 
+ 	// Remove the item from the directory listing
+ 	// called with File.mu released when there is no error removing the underlying file
+--- a/vfs/vfscache/cache.go
++++ b/vfs/vfscache/cache.go
+@@ -502,6 +502,27 @@
+ 	return err
+ }
+ 
++// PrepareUnlink returns the last publication receipt (including cache reloads,
++// which publish without a File callback). A cancelled HTTP PUT can still commit
++// remotely. Only retract a dirty new file if its transfer provably never began.
++func (c *Cache) PrepareUnlink(name string, hasRemote bool) (fs.Object, bool) {
++	c.mu.Lock()
++	item := c.item[clean(name)]
++	c.mu.Unlock()
++	if item == nil {
++		return nil, true
++	}
++	item.mu.Lock()
++	defer item.mu.Unlock()
++	if !item.info.Dirty {
++		return item.o, true
++	}
++	if hasRemote || item.o != nil || item.opens != 0 || item.publishAttempted {
++		return nil, false
++	}
++	return nil, c.writeback.RetractUnstarted(item.writeBackID)
++}
++
+ // Remove should be called if name is deleted
+ //
+ // This returns true if the file was in the transfer queue so may not
+--- a/vfs/vfscache/item.go
++++ b/vfs/vfscache/item.go
+@@ -56,7 +56,8 @@
+ //
+ // The Info field is written to the backing store to store status
+ type Item struct {
+ 	spillWorkers     int
++	publishAttempted bool // protected by mu; recovered dirty state has unknown publication history
+ 	spillPublishing  chan struct{}
+ 	spillFault       error
+ 	// read only
+@@ -168,6 +169,7 @@
+ 
+ 	// Try to load the metadata
+ 	exists, err := item.load()
++	item.publishAttempted = exists && item.info.Dirty
+ 	if !exists {
+ 		item._removeFile("metadata doesn't exist")
+ 	} else if err != nil {
+@@ -739,6 +741,7 @@
+ func (item *Item) store(ctx context.Context, storeFn StoreFn) (err error) {
+ 	item.mu.Lock()
+ 	defer item.mu.Unlock()
++	item.publishAttempted = true
+ 	return item._store(ctx, storeFn)
+ }
+ 
+--- a/vfs/vfscache/writeback/writeback.go
++++ b/vfs/vfscache/writeback/writeback.go
+@@ -299,6 +299,17 @@
+ 	return found
+ }
+ 
++// RetractUnstarted atomically removes work only if it has never been dispatched.
++func (wb *WriteBack) RetractUnstarted(id Handle) bool {
++	wb.mu.Lock()
++	defer wb.mu.Unlock()
++	item := wb.lookup[id]
++	if item == nil || item.uploading || item.tries != 0 {
++		return false
++	}
++	return wb._remove(id)
++}
++
+ // Remove should be called when a file should be removed from the
+ // writeback queue. This cancels a writeback if there is one and
+ // doesn't return the item to the queue.
+--- /dev/null
++++ b/vfs/vfscache/unlink_test.go
+@@ -0,0 +1,37 @@
++package vfscache
++
++import (
++	"testing"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/vfs/vfscommon"
++	"github.com/stretchr/testify/require"
++)
++
++func TestCloudDriveUnlinkAdmission(t *testing.T) {
++	opt := vfscommon.Opt
++	opt.CacheMode = vfscommon.CacheModeFull
++	opt.WriteBack = fs.Duration(time.Hour)
++	_, cache := newTestCacheOpt(t, opt)
++	item := cache.Item("new")
++	itemWrite(t, item, "original")
++	_, ok := cache.PrepareUnlink("new", false)
++	require.False(t, ok, "a writer can still enqueue publication")
++	require.NoError(t, item.Close(nil))
++	_, ok = cache.PrepareUnlink("new", true)
++	require.False(t, ok, "pending edits of an existing cloud object must be retained")
++	item.mu.Lock()
++	item.publishAttempted = true
++	item.mu.Unlock()
++	_, ok = cache.PrepareUnlink("new", false)
++	require.False(t, ok, "an earlier attempt can have committed despite an error")
++	require.Len(t, cache.writeback.Queue(), 1)
++	item.mu.Lock()
++	item.publishAttempted = false
++	item.mu.Unlock()
++	_, ok = cache.PrepareUnlink("new", false)
++	require.True(t, ok, "retract only a never-dispatched brand new file")
++	require.Empty(t, cache.writeback.Queue())
++	cache.Remove("new")
++}
+--- /dev/null
++++ b/vfs/vfscache/writeback/unlink_test.go
+@@ -0,0 +1,33 @@
++package writeback
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestCloudDriveUnlinkDoesNotCancelPublishing(t *testing.T) {
++	wb, cancel := newTestWriteBack(t)
++	defer cancel()
++	entered, release := make(chan struct{}), make(chan struct{})
++	defer close(release)
++	id := wb.Add(0, "committed", 42, false, func(ctx context.Context) error {
++		close(entered)
++		select {
++		case <-release:
++			return nil
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++	})
++	select {
++	case <-entered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("publication did not start")
++	}
++	require.False(t, wb.RetractUnstarted(id))
++	require.Len(t, wb.Queue(), 1)
++	require.True(t, wb.Queue()[0].Uploading)
++}

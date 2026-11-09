@@ -60,3 +60,33 @@ The optional `experiments/streaming-nfs` directory is its own Go module. Its REA
 Keep worker recovery, mount ownership and accepted pending bytes intact. Preserve the distinction between copying locally, uploading, remote publication and independent verification. Do not interpret unknown status as idle or a vanished queue row as a verified upload.
 
 Submit changes with focused tests and note whether validation used local fixtures, a signed package or an actual provider. Never include credentials, runtime records, screenshots of private files, crash dumps or personal account details. Generated app bundles, signing identity pins, test artifacts and caches stay outside version control.
+
+## Finder grouping qualification on November 6, 2026
+
+On this Mac, the installed CloudDrive build 39 and Helumi each handled Finder’s **File → New Folder with Selection** on twelve existing folders containing 765 files. The timed interval began when the test invoked the menu command and ended when the original twelve folders had disappeared and all twelve appeared inside Finder’s new folder. CloudDrive took **1.250 seconds** and Helumi took **0.994 seconds**. These are individual end-to-end observations, including UI automation overhead. A separate attempt to invoke the Helumi command stopped before clicking when Finder lost focus. The test reselected the generated folders and measured the successful invocation.
+
+The CloudDrive fixture used twelve different payloads in an isolated R2 namespace. Each folder contained 63 or 64 file records sharing its folder’s payload. Verification checked all 765 destination paths and sampled each distinct payload through Finder. After the journal drained, the signed diagnostic listed the moved directories, verified the names and immutable locators of all 765 records, and fetched all twelve distinct backing objects directly from R2 using their validators. The diagnostic confirmed a normal unmount and clean owner shutdown. Cleanup removed 235 generated objects, and an independent listing found zero remaining. This exercises grouping existing content. Copying new content and transferring large files have separate qualifications.
+
+To reproduce, register a single signed CloudDrive filesystem extension at the installed application path, mount Helumi, and use the script in an unlocked Finder session. Choose a fresh report path for each run.
+
+```sh
+python3 scripts/qualify-native-finder-project.py --app /Applications/CloudDrive.app --large-group --report build/finder-group-run.json
+```
+
+Build 39 app executable SHA-256 `7c86d8727f856f6330404253a4f0303f18d1f5c4de193c085dc37b5778ac1f07`. Signed application’s final report SHA-256 `653134548b41051f3c182b3ae47efc2bb7801de158434aa974e452cae286d378`.
+
+The final installed build 45 repeated the literal grouping command on a fresh 765-file fixture. CloudDrive took **1.124 seconds** and Helumi **1.266 seconds**. All 765 names and locations matched after the move. The final signed verifier fetched the published R2 records independently, checked the expected grouped layout, compared all twelve distinct immutable backing payloads and confirmed clean unmount and shutdown. Cleanup removed 217 generated R2 keys and verified the fixture prefix was empty. Its report SHA-256 is `262b7e2a5e6d5e099a5cc89ff64b31cbe83754f95a131607cdc115aef3cf2cff`.
+
+### Initial copy of a Logic project package
+
+A separate test duplicated a generated `.logicx` package from the Mac to each mounted volume through Finder. Its 12 takes each contained a Media folder and one 32 KiB payload. Each row used the same source on both volumes, with Helumi first. Timings are individual foreground observations in seconds. All twelve payload hashes matched on Finder return and on an independent R2 read after publication.
+
+| Installed build | CloudDrive | Helumi | Qualification |
+| --- | ---: | ---: | --- |
+| 40 | 5.565 | 1.483 | Finder duplicate. The verifier arranged the generated payload folders after timing. |
+| 42 | 5.122 | 0.935 | Same package. Cached signing handles retain per-connection live identity validation. |
+| 43 | 3.341 | 0.987 | Original package layout preserved and verified against the published R2 namespace. Both volumes had zero AppleDouble companions after copying. |
+
+On build 43, the measured interval contained 15 write calls, 38 creates, 46 extended-attribute updates and 40 other attribute updates on CloudDrive’s synthetic mount. CloudDrive also made 93 directory-list requests accompanied by 93 separate volume-revision requests. Apple’s FSKit diagnostics counted 78 incomplete attribute responses on that mount. The missing standard attribute was the BSD flags field. These counts led to explicitly reporting flags and returning directory identity, contents and revision together in one response. Use a new matched on-device run to establish the effect of those later changes.
+
+Build 44 copied this same package in **1.849 seconds** and produced zero AppleDouble files. The paired Helumi run took 11.064 seconds. Two warm repeats using the exact source took **1.295 and 1.445 seconds** on Helumi, with all twelve hashes matching. The paired outlier makes a single speed ratio misleading. During the CloudDrive run, the FSKit diagnostic count for incomplete attributes fell to zero, as did separate volume-revision calls during enumeration. The original 370 node lookups on build 43 fell to 183 on build 44. These changes shipped alongside optimized Swift compilation and write-path improvements, so the timing comparison measures their combined effect.

@@ -1,0 +1,363 @@
+--- /dev/null
++++ b/create_gate.go
+@@ -0,0 +1,135 @@
++// Modified for CloudDrive: serialize same-parent NFS create admission and validate exclusive replay.
++package nfs
++
++import (
++	"errors"
++	"os"
++	"sync"
++
++	"github.com/go-git/go-billy/v5"
++	nfsfile "github.com/willscott/go-nfs/file"
++)
++
++// Every request for an equivalent name in the same directory uses the same lock,
++// including GUARDED, UNCHECKED and MKDIR. Data writes and lookups do not take it.
++type createGate struct {
++	parents  [64]sync.Mutex
++	mu       sync.Mutex
++	receipts [1024]createReceipt
++	next     uint32
++}
++
++type createReceipt struct {
++	path     string
++	verifier [8]byte
++	inode    uint64
++}
++
++func createInode(info os.FileInfo) uint64 {
++	if attr := nfsfile.GetInfo(info); attr != nil {
++		return attr.Fileid
++	}
++	return 0
++}
++
++func (g *createGate) lockParent(fs billy.Filesystem, parent string) (func(), error) {
++	info, err := fs.Stat(parent)
++	if err != nil {
++		return nil, &NFSStatusError{NFSStatusAccess, err}
++	}
++	if !info.IsDir() {
++		return nil, &NFSStatusError{NFSStatusNotDir, nil}
++	}
++	lock := &g.parents[createInode(info)%uint64(len(g.parents))]
++	lock.Lock()
++	return lock.Unlock, nil
++}
++
++func (g *createGate) matches(receipt createReceipt) bool {
++	if receipt.inode == 0 {
++		return false
++	}
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	for _, entry := range g.receipts {
++		if entry == receipt {
++			return true
++		}
++	}
++	return false
++}
++
++func (g *createGate) remember(receipt createReceipt) {
++	if receipt.inode == 0 {
++		return
++	}
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	g.receipts[g.next] = receipt
++	g.next = (g.next + 1) % uint32(len(g.receipts))
++}
++
++// The verifier identifies the client's logical exclusive request across TCP retries.
++// Eviction, worker restart, or a new inode fails closed with EXIST on an occupied path.
++
++func (g *createGate) makeFile(fs billy.Filesystem, parent, name string, how uint32, verifier [8]byte) error {
++	unlock, err := g.lockParent(fs, parent)
++	if err != nil {
++		return err
++	}
++	defer unlock()
++	info, err := fs.Lstat(name)
++	if err == nil {
++		if !info.Mode().IsRegular() {
++			return &NFSStatusError{NFSStatusExist, os.ErrExist}
++		}
++		// The caller applies the requested attributes, including any explicit size.
++		if how == createModeUnchecked {
++			return nil
++		}
++		if how == createModeExclusive && g.matches(createReceipt{name, verifier, createInode(info)}) {
++			return nil
++		}
++		return &NFSStatusError{NFSStatusExist, os.ErrExist}
++	}
++	if !errors.Is(err, os.ErrNotExist) {
++		return &NFSStatusError{NFSStatusAccess, err}
++	}
++	fd, err := fs.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
++	if errors.Is(err, os.ErrExist) {
++		return &NFSStatusError{NFSStatusExist, err}
++	}
++	if err != nil {
++		return &NFSStatusError{NFSStatusAccess, err}
++	}
++	if err = fd.Close(); err != nil {
++		return &NFSStatusError{NFSStatusIO, err}
++	}
++	if how == createModeExclusive {
++		info, err = fs.Lstat(name)
++		if err != nil {
++			return &NFSStatusError{NFSStatusIO, err}
++		}
++		g.remember(createReceipt{name, verifier, createInode(info)})
++	}
++	return nil
++}
++
++func (g *createGate) makeDirectory(fs billy.Filesystem, parent, name string, perm os.FileMode) error {
++	unlock, err := g.lockParent(fs, parent)
++	if err != nil {
++		return err
++	}
++	defer unlock()
++	_, err = fs.Lstat(name)
++	if err == nil {
++		return &NFSStatusError{NFSStatusExist, os.ErrExist}
++	}
++	if !errors.Is(err, os.ErrNotExist) {
++		return &NFSStatusError{NFSStatusAccess, err}
++	}
++	if err = fs.MkdirAll(name, perm); err != nil {
++		return &NFSStatusError{NFSStatusAccess, err}
++	}
++	return nil
++}
+--- /dev/null
++++ b/create_gate_test.go
+@@ -0,0 +1,94 @@
++package nfs
++
++import (
++	"errors"
++	"github.com/go-git/go-billy/v5/osfs"
++	"os"
++	"sync"
++	"testing"
++)
++
++func TestExclusiveAdmission(t *testing.T) {
++	for _, dir := range []bool{false, true} {
++		fs := osfs.New(t.TempDir())
++		var gate createGate
++		start := make(chan struct{})
++		results := make(chan error, 32)
++		for i := 0; i < 32; i++ {
++			i := i
++			go func() {
++				<-start
++				if dir {
++					results <- gate.makeDirectory(fs, ".", "item", 0755)
++				} else {
++					results <- gate.makeFile(fs, ".", "item", createModeExclusive, [8]byte{byte(i)})
++				}
++			}()
++		}
++		close(start)
++		wins := 0
++		for i := 0; i < 32; i++ {
++			err := <-results
++			if err == nil {
++				wins++
++			} else if !errors.Is(err, os.ErrExist) {
++				t.Fatal(err)
++			}
++		}
++		if wins != 1 {
++			t.Fatalf("dir %v winners %d", dir, wins)
++		}
++	}
++}
++func TestExclusiveReplay(t *testing.T) {
++	root := t.TempDir()
++	fs := osfs.New(root)
++	var g createGate
++	verifier := [8]byte{42}
++	if err := g.makeFile(fs, ".", "item", createModeExclusive, verifier); err != nil {
++		t.Fatal(err)
++	}
++	write := func(contents string) {
++		t.Helper()
++		if err := os.WriteFile(root+"/item", []byte(contents), 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	write("original")
++	var wg sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			if err := g.makeFile(fs, ".", "item", createModeExclusive, verifier); err != nil {
++				t.Error(err)
++			}
++		}()
++	}
++	wg.Wait()
++	for _, row := range []struct {
++		mode     uint32
++		verifier [8]byte
++	}{{createModeGuarded, verifier}, {createModeExclusive, [8]byte{1}}} {
++		if err := g.makeFile(fs, ".", "item", row.mode, row.verifier); !errors.Is(err, os.ErrExist) {
++			t.Fatal(err)
++		}
++	}
++	if err := g.makeFile(fs, ".", "item", createModeUnchecked, verifier); err != nil {
++		t.Fatal(err)
++	}
++	b, err := os.ReadFile(root + "/item")
++	if err != nil || string(b) != "original" {
++		t.Fatal(err, string(b))
++	}
++	if err := os.Rename(root+"/item", root+"/old"); err != nil {
++		t.Fatal(err)
++	}
++	write("new owner")
++	if err := g.makeFile(fs, ".", "item", createModeExclusive, verifier); !errors.Is(err, os.ErrExist) {
++		t.Fatal(err)
++	}
++	if err := g.makeDirectory(fs, ".", "item", 0755); !errors.Is(err, os.ErrExist) {
++		t.Fatal(err)
++	}
++}
+--- a/nfs_oncreate.go
++++ b/nfs_oncreate.go
+@@ -1,3 +1,4 @@
++// Modified for CloudDrive (2026-11-06): coordinate exclusive namespace creation.
+ package nfs
+ 
+ import (
+@@ -26,6 +27,7 @@
+ 	if err != nil {
+ 		return &NFSStatusError{NFSStatusInval, err}
+ 	}
++	var verf [8]byte
+ 	var attrs *SetFileAttributes
+ 	if how == createModeUnchecked || how == createModeGuarded {
+ 		sattr, err := ReadSetFileAttributes(w.req.Body)
+@@ -35,13 +37,9 @@
+ 		attrs = sattr
+ 	} else if how == createModeExclusive {
+ 		// read createverf3
+-		var verf [8]byte
+ 		if err := xdr.Read(w.req.Body, &verf); err != nil {
+ 			return &NFSStatusError{NFSStatusInval, err}
+ 		}
+-		Log.Errorf("failing create to indicate lack of support for 'exclusive' mode.")
+-		// TODO: support 'exclusive' mode.
+-		return &NFSStatusError{NFSStatusNotSupp, os.ErrPermission}
+ 	} else {
+ 		// invalid
+ 		return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
+@@ -61,36 +59,14 @@
+ 
+ 	newFile := append(path, string(obj.Filename))
+ 	newFilePath := fs.Join(newFile...)
+-	if s, err := fs.Stat(newFilePath); err == nil {
+-		if s.IsDir() {
+-			return &NFSStatusError{NFSStatusExist, nil}
+-		}
+-		if how == createModeGuarded {
+-			return &NFSStatusError{NFSStatusExist, os.ErrPermission}
+-		}
+-	} else {
+-		if s, err := fs.Stat(fs.Join(path...)); err != nil {
+-			return &NFSStatusError{NFSStatusAccess, err}
+-		} else if !s.IsDir() {
+-			return &NFSStatusError{NFSStatusNotDir, nil}
+-		}
++	if err := w.Server.creates.makeFile(fs, fs.Join(path...), newFilePath, how, verf); err != nil {
++		return err
+ 	}
+-
+-	file, err := fs.Create(newFilePath)
+-	if err != nil {
+-		Log.Errorf("Error Creating: %v", err)
+-		return &NFSStatusError{NFSStatusAccess, err}
+-	}
+-	if err := file.Close(); err != nil {
+-		Log.Errorf("Error Creating: %v", err)
+-		return &NFSStatusError{NFSStatusAccess, err}
+-	}
+-
+ 	fp := userHandle.ToHandle(fs, newFile)
+-	changer := userHandle.Change(fs)
+-	if err := attrs.Apply(changer, fs, newFilePath); err != nil {
+-		Log.Errorf("Error applying attributes: %v\n", err)
+-		return &NFSStatusError{NFSStatusIO, err}
++	if attrs != nil {
++		if err := attrs.Apply(userHandle.Change(fs), fs, newFilePath); err != nil {
++			return &NFSStatusError{NFSStatusIO, err}
++		}
+ 	}
+ 
+ 	writer := bytes.NewBuffer([]byte{})
+@@ -105,7 +81,7 @@
+ 	if err := xdr.Write(writer, fp); err != nil {
+ 		return &NFSStatusError{NFSStatusServerFault, err}
+ 	}
+-	if err := WritePostOpAttrs(writer, tryStat(fs, []string{file.Name()})); err != nil {
++	if err := WritePostOpAttrs(writer, tryStat(fs, newFile)); err != nil {
+ 		return &NFSStatusError{NFSStatusServerFault, err}
+ 	}
+ 
+--- a/nfs_onmkdir.go
++++ b/nfs_onmkdir.go
+@@ -1,3 +1,4 @@
++// Modified for CloudDrive (2026-11-06): coordinate exclusive namespace creation.
+ package nfs
+ 
+ import (
+@@ -43,22 +44,10 @@
+ 
+ 	newFolder := append(path, string(obj.Filename))
+ 	newFolderPath := fs.Join(newFolder...)
+-	if s, err := fs.Stat(newFolderPath); err == nil {
+-		if s.IsDir() {
+-			return &NFSStatusError{NFSStatusExist, nil}
+-		}
+-	} else {
+-		if s, err := fs.Stat(fs.Join(path...)); err != nil {
+-			return &NFSStatusError{NFSStatusAccess, err}
+-		} else if !s.IsDir() {
+-			return &NFSStatusError{NFSStatusNotDir, nil}
+-		}
++	if err := w.Server.creates.makeDirectory(fs, fs.Join(path...), newFolderPath, attrs.Mode(mkdirDefaultMode)); err != nil {
++		return err
+ 	}
+ 
+-	if err := fs.MkdirAll(newFolderPath, attrs.Mode(mkdirDefaultMode)); err != nil {
+-		return &NFSStatusError{NFSStatusAccess, err}
+-	}
+-
+ 	fp := userHandle.ToHandle(fs, newFolder)
+ 	changer := userHandle.Change(fs)
+ 	if changer != nil {
+--- a/server.go
++++ b/server.go
+@@ -1,3 +1,4 @@
++// Modified for CloudDrive (2026-11-06): coordinate exclusive namespace creation.
+ package nfs
+ 
+ import (
+@@ -11,6 +12,7 @@
+ 
+ // Server is a handle to the listening NFS server.
+ type Server struct {
++	creates createGate
+ 	Handler
+ 	ID [8]byte
+ 	context.Context

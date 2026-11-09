@@ -89,7 +89,7 @@ def main():
         assert str(cache_root).startswith(str(cache)+'/')
         cached = cache_root/'upload.bin'
         assert not local.is_mounted(mount)
-        local.command(['/sbin/mount_nfs','-o',f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,nodev,nosuid','127.0.0.1:/',str(mount)])
+        local.command(['/sbin/mount_nfs','-o',f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,mutejukebox,nodev,nosuid','127.0.0.1:/',str(mount)])
         assert local.is_mounted(mount)
         passed.append('isolated native mount with cloud-first cache settings')
         started = time.monotonic()
@@ -149,7 +149,7 @@ with open(sys.argv[1],'rb') as src, open(sys.argv[2],'xb') as dst:
         # fixture while leaving its backend/cache worker alive.
         local.command(['/sbin/umount',str(mount)])
         assert worker.poll() is None
-        local.command(['/sbin/mount_nfs','-o',f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,nodev,nosuid','127.0.0.1:/',str(mount)])
+        local.command(['/sbin/mount_nfs','-o',f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,mutejukebox,nodev,nosuid','127.0.0.1:/',str(mount)])
         reader = subprocess.Popen([sys.executable,'-c','''
 import hashlib,pathlib,sys,time
 p=pathlib.Path(sys.argv[1]);h=hashlib.sha256()

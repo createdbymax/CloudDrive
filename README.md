@@ -2,9 +2,11 @@
 
 A small macOS app that puts your own Cloudflare R2 bucket in Finder.
 
-Connect a dedicated bucket prefix, copy files using Finder, and watch uploads from the menu bar. Credentials stay in macOS Keychain. Files are stored as ordinary objects; uploaded file data is automatically removed from the temporary local cache when eligible.
+Connect a dedicated bucket prefix and use Finder to copy files, group them into folders, rename them and open them. Credentials stay in macOS Keychain.
 
-**Early development software.** The current app stages a whole file locally before uploading it. Deleting a file deletes its remote object; trash and version recovery are not implemented. Keep originals and use a dedicated test prefix. See [current limitations](docs/LIMITATIONS.md).
+On a Mac with the signed FSKit extension enabled, this development build offers an indexed personal drive. Setup imports the names and sizes of existing objects without downloading their contents. A move within the drive changes the item's name or parent in the index. Existing R2 objects keep their original keys; after setup use Finder to manage the drive, since the R2 dashboard does not show the indexed folder layout.
+
+Finder can accept files in stages while CloudDrive sends bytes to R2. Keep the source disk connected until Finder finishes and the Mac online until publication completes. A reported Finder success and a verified R2 publication are separate milestones. See [Finder writeback and qualification](docs/FINDER_WRITEBACK.md). Released builds and the legacy mount can behave differently; see [development limits](docs/LIMITATIONS.md).
 
 ## Download
 
@@ -16,13 +18,17 @@ I'd love for CloudDrive to become a community project. Bug reports, ideas, docs,
 
 Have a look at the [contribution guide](CONTRIBUTING.md) or [open an issue](https://github.com/createdbymax/CloudDrive/issues/new/choose). You can build a UI preview and run the tests without an R2 account or a signing certificate. If you're not sure where to start, ask in an issue.
 
+## Local search
+
+Open **Search Drive…** (Command–Shift–F) to search the automatically maintained metadata inventory. Filename/path searches then work locally and offline, with extension and size filters. Indexing downloads no file contents. Verified uploads and Finder edits update it automatically; outside changes are discovered periodically. Opening uncached files still needs Finder and connectivity. See [local search](docs/LOCAL_SEARCH.md) for behavior and limits.
+
 ## Development
 
 Requirements: an Apple Silicon Mac that can run Xcode 26 or later (including the macOS 26 SDK), Python 3, and internet access for the initial backend build. The app itself supports macOS 14 or later. The current pinned backend build targets `darwin/arm64`.
 
 Open **`CloudDrive.xcodeproj`** in Xcode, choose the **CloudDrive** scheme and **My Mac**, then press **⌘R** to build and run the complete app. First build the backend once using the command below and follow [signing setup](docs/KEYCHAIN_SIGNING_SETUP.md). Xcode builds both native Swift targets, bundles the backend/helper/notices and applies the same stable signing checks as the command-line packager. Use Product → Show Build Folder in Finder to locate the built app under `Products/Debug/CloudDrive.app`.
 
-`Package.swift` remains available for SwiftPM builds and the test suite. The Xcode project is checked in; no project-generator installation is needed. After adding or removing Swift source files, regenerate it with `python3 scripts/generate-xcode-project.py`.
+`Package.swift` remains available for SwiftPM builds and the test suite. The Xcode navigator mirrors the repository, including tests, documentation, scripts, assets, experiments and GitHub configuration. Build outputs and ignored local files are excluded. Browsing these files does not add them to the app's build targets; tests still run through SwiftPM. The Xcode project is checked in; no project-generator installation is needed. After adding or removing repository files, regenerate it with `python3 scripts/generate-xcode-project.py`.
 
 ```sh
 # Build the pinned backend from public sources and local patches.
@@ -54,11 +60,13 @@ Sparkle provides user-approved updates with a safe-eject guard. Packaged builds 
 
 1. Create or select a private R2 bucket and a dedicated prefix.
 2. Enter its S3 endpoint, bucket, prefix and scoped access keys in CloudDrive's setup screen.
-3. Connect, then open the drive in Finder. Use the menu's Transfers item for progress and Settings for upload limits.
-4. Eject the drive before quitting. Closing a window leaves the drive running.
+3. Choose **Open in Finder**, then drag files into their destination folder. Open **Transfers** from CloudDrive’s menu to see activity.
+4. Copy large files from your external disk through the same Finder window. Keep the disk connected until Finder finishes, and keep CloudDrive connected until Transfers finishes publishing to R2.
 5. Optionally enable **Settings → General → Open at Login** to start CloudDrive when you sign in. If macOS requests approval, use the Login Items Settings button.
 
-Never put keys in source files or commit them to Git. Large writes require temporary local space. Copying does not remove the source original.
+Never put keys in source files or commit them to Git. New Finder copies use temporary local space and verified chunks in a private R2 prefix. See [Finder writeback, recovery and qualification](docs/FINDER_WRITEBACK.md) and [recovery of older direct upload queues](docs/DIRECT_UPLOADS.md).
+
+On the legacy mount, moves use recoverable server-side copy/delete and preserve native child handles. See [Finder moves and recovery](docs/FINDER_MOVES.md) for progress, limits, and validation.
 
 ## Project layout
 

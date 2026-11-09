@@ -4,6 +4,7 @@
 Artifacts are removed only after success, confirmed unmount and worker exit.
 Every failure retains the fixture and its private control record for diagnosis.
 """
+import argparse
 import base64
 import json
 import os
@@ -67,6 +68,13 @@ def filesystem(code, *args):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--backend', type=pathlib.Path, default=ROOT/'build/backend/rclone')
+    parser.add_argument('--check-exclusive-create', action='store_true',
+                        help='race eight exclusive file creators and verify winner contents on the backend')
+    parser.add_argument('--check-exclusive-mkdir', action='store_true',
+                        help='probe directory ownership too (known to fail on the macOS NFS client)')
+    args = parser.parse_args()
     root = pathlib.Path(tempfile.mkdtemp(prefix='clouddrive-qualification-')).resolve()
     root.chmod(0o700)
     source, mount = root / 'source', root / 'mount'
@@ -79,7 +87,7 @@ def main():
     env = {k: os.environ[k] for k in ('PATH', 'HOME', 'TMPDIR', 'LANG') if k in os.environ}
     env.update(RCLONE_RC_USER='fixture', RCLONE_RC_PASS=password)
     worker = subprocess.Popen([
-        str(ROOT / 'build/backend/rclone'), 'serve', 'nfs', str(source),
+        str(args.backend.resolve(strict=True)), 'serve', 'nfs', str(source),
         '--addr', f'127.0.0.1:{nfs}', '--config', '/dev/null',
         '--vfs-cache-mode', 'full', '--vfs-write-back', '1s',
         '--cache-dir', str(root / 'cache'), '--rc', '--rc-addr', f'127.0.0.1:{rc}'
@@ -111,7 +119,7 @@ def main():
         if is_mounted(mount):
             raise RuntimeError('fixture path is already mounted; refusing to overlay it')
         command(['/sbin/mount_nfs', '-o',
-                 f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,nodev,nosuid',
+                 f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,mutejukebox,nodev,nosuid',
                  '127.0.0.1:/', str(mount)])
         if not is_mounted(mount):
             raise RuntimeError('mount helper succeeded without a visible mount')
@@ -132,6 +140,40 @@ def main():
         assert stats['diskCache']['path'].startswith(str(root / 'cache') + '/')
         passed.append('authenticated backend/cache identity')
         mount_fixture(); passed.append('native mount')
+        if args.check_exclusive_create or args.check_exclusive_mkdir:
+            filesystem('''
+import concurrent.futures, json, pathlib, sys, threading
+mount, receipt = map(pathlib.Path, sys.argv[1:3])
+winners = {}
+for kind in (["file", "directory"] if sys.argv[3] == "True" else ["file"]):
+    ready = threading.Barrier(8)
+    target = mount / ("exclusive-" + kind)
+    def claim(index):
+        ready.wait(timeout=5)
+        try:
+            if kind == "directory":
+                target.mkdir()
+                owned = target / ("winner-" + str(index))
+            else:
+                owned = target
+            with owned.open("xb") as handle:
+                handle.write(str(index).encode())
+        except FileExistsError:
+            return None
+        return index
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(claim, range(8)))
+    won = [value for value in results if value is not None]
+    assert len(won) == 1, (kind, results)
+    winners[kind] = str(won[0])
+receipt.write_text(json.dumps(winners))
+''', mount, root/'exclusive-winners.json', args.check_exclusive_mkdir)
+            winners = json.loads((root/'exclusive-winners.json').read_text())
+            until(lambda: (source/'exclusive-file').read_text() == winners['file'])
+            passed.append('one of eight exclusive file claims wins with independently verified contents')
+            if args.check_exclusive_mkdir:
+                until(lambda: (source/'exclusive-directory'/('winner-' + winners['directory'])).read_text() == winners['directory'])
+                passed.append('one of eight directory creations succeeds with independently verified contents')
         filesystem('''
 import hashlib, os, pathlib, sys
 m=pathlib.Path(sys.argv[1]); s=pathlib.Path(sys.argv[2])

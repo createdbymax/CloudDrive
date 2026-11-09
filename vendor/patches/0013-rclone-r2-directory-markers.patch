@@ -1,0 +1,192 @@
+--- a/backend/s3/s3.go
++++ b/backend/s3/s3.go
+@@ -1175,6 +1175,7 @@
+ 
+ // Object describes a s3 object
+ type Object struct {
++	conditionalEmptyMarker bool // only set by createDirectoryMarker on its transient marker object
+ 	// Will definitely have everything but meta which may be nil
+ 	//
+ 	// List will read everything but meta & mimeType - to fill
+@@ -2862,7 +2863,7 @@
+ }
+ 
+ // Create directory marker file and parents
+-func (f *Fs) createDirectoryMarker(ctx context.Context, bucket, dir string) error {
++func (f *Fs) createDirectoryMarker(ctx context.Context, bucket, dir string, newLeaf bool) error {
+ 	if !f.opt.DirectoryMarkers || bucket == "" {
+ 		return nil
+ 	}
+@@ -2883,16 +2884,23 @@
+ 		}
+ 		o.remote = dir + "/"
+ 
+-		// Check to see if object already exists
+-		_, err := o.headObject(ctx)
+-		if err == nil {
+-			return nil
+-		}
+-
+-		// Upload it if not
++		var options []fs.OpenOption
++		o.conditionalEmptyMarker = newLeaf
++		if newLeaf {
++			options = append(options, &fs.HTTPOption{Key: "If-None-Match", Value: "*"})
++		} else {
++			// Inferred parents usually exist. Preserve their marker metadata.
++			if _, err := o.headObject(ctx); err == nil {
++				return nil
++			}
++		}
++
+ 		fs.Debugf(o, "Creating directory marker")
+-		content := io.Reader(strings.NewReader(""))
+-		err = o.Update(ctx, content, o)
++		err := o.Update(ctx, strings.NewReader(""), o, options...)
++		if newLeaf && getHTTPStatusCode(err) == http.StatusPreconditionFailed {
++			return nil // The conditional PUT preserved a concurrent or pre-existing marker.
++		}
++		newLeaf = false // Ancestors take the normal existing-marker path.
+ 		if err != nil {
+ 			return fmt.Errorf("creating directory marker failed: %w", err)
+ 		}
+@@ -2914,7 +2922,19 @@
+ 	if e != nil {
+ 		return e
+ 	}
+-	return f.createDirectoryMarker(ctx, bucket, dir)
++	return f.createDirectoryMarker(ctx, bucket, dir, false)
++}
++
++// MkdirNew is used only after VFS lookup reports the child absent.
++func (f *Fs) MkdirNew(ctx context.Context, dir string) error {
++	if f.opt.Provider != "Cloudflare" || !f.opt.DirectoryMarkers {
++		return f.Mkdir(ctx, dir)
++	}
++	bucket, _ := f.split(dir)
++	if err := f.makeBucket(ctx, bucket); err != nil {
++		return err
++	}
++	return f.createDirectoryMarker(ctx, bucket, dir, true)
+ }
+ 
+ // mkdirParent creates the parent bucket/directory if it doesn't exist
+@@ -5149,7 +5169,11 @@
+ 	// so make up the object as best we can assuming it got
+ 	// uploaded properly. If size < 0 then we need to do the HEAD.
+ 	var head *s3.HeadObjectOutput
+-	if o.fs.opt.NoHead && size >= 0 {
++	// A successful single-part conditional PUT returning the empty-body MD5
++	// confirms this zero-byte marker. Fall back to HEAD with other ETags.
++	confirmedEmptyMarker := o.conditionalEmptyMarker && size == 0 && !multipart &&
++		strings.Trim(gotETag, "\"") == "d41d8cd98f00b204e9800998ecf8427e"
++	if (o.fs.opt.NoHead || confirmedEmptyMarker) && size >= 0 {
+ 		head = new(s3.HeadObjectOutput)
+ 		//structs.SetFrom(head, &req)
+ 		setFrom_s3HeadObjectOutput_s3PutObjectInput(head, ui.req)
+--- /dev/null
++++ b/backend/s3/clouddrive_marker_test.go
+@@ -0,0 +1,76 @@
++package s3
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"testing"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/config/configmap"
++	"github.com/stretchr/testify/require"
++)
++
++func TestCloudDriveNewDirectoryMarker(t *testing.T) {
++	for _, test := range []struct {
++		name      string
++		status    int
++		etag      string
++		wantError bool
++		want      []string
++	}{
++		{"confirmed empty", 200, `"d41d8cd98f00b204e9800998ecf8427e"`, false, []string{"PUT child", "HEAD parent"}},
++		{"concurrent existing marker", 412, "", false, []string{"PUT child"}},
++		{"denied", 403, "", true, []string{"PUT child"}},
++		{"opaque etag verifies by HEAD", 200, `"opaque"`, false, []string{"PUT child", "HEAD child", "HEAD parent"}},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			var mu sync.Mutex
++			var requests []string
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				name := "child"
++				if r.URL.Path == "/fixture/parent/" {
++					name = "parent"
++				} else if r.URL.Path != "/fixture/parent/child/" {
++					t.Errorf("unexpected path %s", r.URL.Path)
++				}
++				mu.Lock()
++				requests = append(requests, r.Method+" "+name)
++				mu.Unlock()
++				if r.Method == http.MethodPut {
++					if r.Header.Get("If-None-Match") != "*" || r.ContentLength != 0 {
++						t.Error("marker PUT must be an exclusive zero-byte creation")
++					}
++					if test.etag != "" {
++						w.Header().Set("ETag", test.etag)
++					}
++					w.WriteHeader(test.status)
++					return
++				}
++				w.Header().Set("Content-Length", "0")
++				w.Header().Set("Last-Modified", "Wed, 04 Nov 2026 12:00:00 GMT")
++				w.Header().Set("ETag", `"opaque"`)
++			}))
++			defer server.Close()
++			info, err := fs.Find("s3")
++			require.NoError(t, err)
++			config := fs.ConfigMap("s3", info.Options, "marker-fixture", configmap.Simple{
++				"provider": "Cloudflare", "access_key_id": "fixture", "secret_access_key": "fixture",
++				"region": "auto", "endpoint": server.URL, "directory_markers": "true",
++				"no_check_bucket": "true", "force_path_style": "true",
++			})
++			backend, err := NewFs(context.Background(), "marker-fixture", "fixture", config)
++			require.NoError(t, err)
++			err = backend.(*Fs).MkdirNew(context.Background(), "parent/child")
++			if test.wantError {
++				require.Error(t, err)
++			} else {
++				require.NoError(t, err)
++			}
++			mu.Lock()
++			defer mu.Unlock()
++			require.Equal(t, test.want, requests)
++		})
++	}
++}
+--- a/vfs/dir.go
++++ b/vfs/dir.go
+@@ -1,6 +1,7 @@
+ package vfs
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+@@ -1146,7 +1147,15 @@
+ 		return nil, err
+ 	}
+ 	// fs.Debugf(path, "Dir.Mkdir")
+-	err = d.f.Mkdir(d.vfs.ctx, path)
++	// Some object stores can conditionally create a marker without a second
++	// existence probe after this directory listing reported the name absent.
++	if maker, ok := d.f.(interface {
++		MkdirNew(context.Context, string) error
++	}); ok {
++		err = maker.MkdirNew(d.vfs.ctx, path)
++	} else {
++		err = d.f.Mkdir(d.vfs.ctx, path)
++	}
+ 	if err != nil {
+ 		fs.Errorf(d, "Dir.Mkdir failed to create directory: %v", err)
+ 		return nil, err

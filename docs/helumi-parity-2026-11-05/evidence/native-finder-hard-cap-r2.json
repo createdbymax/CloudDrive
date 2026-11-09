@@ -1,0 +1,17 @@
+{
+  "build": 40,
+  "scope": "real Finder, mounted FSKit and managed R2",
+  "success": true,
+  "engineSHA256": "6f534a4091034ea4a423c6ddd91f110e207a8217d819c26028edb7e8d3d57797",
+  "payloadBytes": 234881024,
+  "hardCapacityBytes": 167731200,
+  "initialAvailableBytes": 166268928,
+  "peakVolumeUseBytes": 46284800,
+  "finderSeconds": 34.302,
+  "r2SHA256": "638add8a5aa7f3ba390a8c4c0950755a8a1bf328321d262dad4859e7bb8241e8",
+  "sourceSHA256": "638add8a5aa7f3ba390a8c4c0950755a8a1bf328321d262dad4859e7bb8241e8",
+  "verifiedSeconds": 104.506,
+  "generatedKeysRemoved": 43,
+  "remainingKeys": 0,
+  "cacheDetached": true
+}

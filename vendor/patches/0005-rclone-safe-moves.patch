@@ -1,0 +1,2813 @@
+--- a/cmd/serve/nfs/cache.go
++++ b/cmd/serve/nfs/cache.go
+@@ -321,3 +321,13 @@
+ func (dh *diskHandler) HandleLimit() int {
+ 	return math.MaxInt
+ }
++
++// RenameHandles translates rename paths before updating the active cache.
++func (c *pathRewriter) RenameHandles(f billy.Filesystem, oldPath, newPath []string) error {
++	root, oldAbs := c.translate(f, oldPath)
++	_, newAbs := c.translate(f, newPath)
++	if h, ok := c.inner.(nfs.RenameHandler); ok {
++		return h.RenameHandles(root, oldAbs, newAbs)
++	}
++	return c.inner.InvalidateHandle(root, c.inner.ToHandle(root, oldAbs))
++}
+--- a/cmd/serve/nfs/cache_test.go
++++ b/cmd/serve/nfs/cache_test.go
+@@ -3,11 +3,19 @@
+ package nfs
+ 
+ import (
++	"bytes"
+ 	"context"
++	"crypto/rand"
++	"errors"
+ 	"fmt"
++	_ "github.com/rclone/rclone/backend/memory"
++	"github.com/rclone/rclone/vfs/vfscommon"
++	"path/filepath"
+ 	"strings"
+ 	"sync"
++	"syscall"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/rclone/rclone/fs"
+ 	"github.com/rclone/rclone/fs/object"
+@@ -219,3 +227,41 @@
+ 		})
+ 	}
+ }
++
++func TestNativeMoveReplayPreservesDestinationHandle(t *testing.T) {
++	ctx := context.Background()
++	f, e := fs.NewFs(ctx, ":memory:clouddrive-"+rand.Text())
++	require.NoError(t, e)
++	_, e = f.Put(ctx, bytes.NewBufferString("payload"), object.NewStaticObjectInfo("a", time.Unix(100, 0), 7, true, nil, f))
++	require.NoError(t, e)
++	opt := vfscommon.Opt
++	opt.MoveJournal = filepath.Join(t.TempDir(), "moves")
++	v := vfs.New(ctx, f, &opt)
++	defer v.Shutdown()
++	handler, e := NewHandler(ctx, v, &Options{HandleLimit: 100})
++	require.NoError(t, e)
++	h := handler.(*Handler)
++	handle := h.ToHandle(h.billyFS, []string{"a"})
++	require.Eventually(t, func() bool {
++		e := h.billyFS.Rename("a", "b")
++		if errors.Is(e, syscall.EBUSY) {
++			return false
++		}
++		require.NoError(t, e)
++		return true
++	}, 5*time.Second, 10*time.Millisecond)
++	require.NoError(t, h.RenameHandles(h.billyFS, []string{"a"}, []string{"b"}))
++	require.Eventually(t, func() bool {
++		e := h.billyFS.Rename("a", "b")
++		if errors.Is(e, syscall.EBUSY) {
++			return false
++		}
++		require.NoError(t, e)
++		return true
++	}, 5*time.Second, 10*time.Millisecond)
++	require.NoError(t, h.RenameHandles(h.billyFS, []string{"a"}, []string{"b"}))
++	_, p, e := h.FromHandle(handle)
++	require.NoError(t, e)
++	require.Equal(t, []string{"b"}, p)
++	require.Equal(t, handle, h.ToHandle(h.billyFS, []string{"b"}))
++}
+--- a/cmd/serve/nfs/filesystem.go
++++ b/cmd/serve/nfs/filesystem.go
+@@ -6,6 +6,7 @@
+ 	"os"
+ 	"path"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	billy "github.com/go-git/go-billy/v5"
+@@ -65,6 +66,9 @@
+ 
+ // ReadDir implements read dir
+ func (f *FS) ReadDir(p string) (dir []os.FileInfo, err error) {
++	if e := f.vfs.CheckMovePath(f.fullPath(p)); e != nil {
++		return nil, e
++	}
+ 	p = f.fullPath(p)
+ 	defer log.Trace(p, "")("items=%d, err=%v", &dir, &err)
+ 	dir, err = f.vfs.ReadDir(p)
+@@ -82,11 +86,24 @@
+ func (f *FS) Create(filename string) (node billy.File, err error) {
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("%v, err=%v", &node, &err)
+-	return f.vfs.Create(filename)
++	release, err := f.vfs.LockMoveMutation()
++	if err != nil {
++		return nil, err
++	}
++	f.vfs.NotifyMoveCreation(filename)
++	fd, err := f.vfs.Create(filename)
++	if err != nil {
++		release()
++		return nil, err
++	}
++	return &mutationFile{File: fd, release: release}, nil
+ }
+ 
+ // Open opens a file
+ func (f *FS) Open(filename string) (node billy.File, err error) {
++	if e := f.vfs.CheckMovePath(f.fullPath(filename)); e != nil {
++		return nil, e
++	}
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("%v, err=%v", &node, &err)
+ 	return f.vfs.Open(filename)
+@@ -94,13 +111,34 @@
+ 
+ // OpenFile opens a file
+ func (f *FS) OpenFile(filename string, flag int, perm os.FileMode) (node billy.File, err error) {
++	if e := f.vfs.CheckMovePath(f.fullPath(filename)); e != nil {
++		return nil, e
++	}
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "flag=0x%X, perm=%v", flag, perm)("%v, err=%v", &node, &err)
+-	return f.vfs.OpenFile(filename, flag, perm)
++	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) == 0 {
++		return f.vfs.OpenFile(filename, flag, perm)
++	}
++	release, err := f.vfs.LockMoveMutation()
++	if err != nil {
++		return nil, err
++	}
++	if flag&os.O_CREATE != 0 {
++		f.vfs.NotifyMoveCreation(filename)
++	}
++	fd, err := f.vfs.OpenFile(filename, flag, perm)
++	if err != nil {
++		release()
++		return nil, err
++	}
++	return &mutationFile{File: fd, release: release}, nil
+ }
+ 
+ // Stat gets the file stat
+ func (f *FS) Stat(filename string) (fi os.FileInfo, err error) {
++	if e := f.vfs.CheckMovePath(f.fullPath(filename)); e != nil {
++		return nil, e
++	}
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("fi=%v, err=%v", &fi, &err)
+ 	fi, err = f.vfs.Stat(filename)
+@@ -116,11 +154,21 @@
+ 	oldpath = f.fullPath(oldpath)
+ 	newpath = f.fullPath(newpath)
+ 	defer log.Trace(oldpath, "newpath=%q", newpath)("err=%v", &err)
+-	return f.vfs.Rename(oldpath, newpath)
++	return f.vfs.RenameNative(oldpath, newpath)
++}
++
++// RenameRequest carries the NFS transaction identity through asynchronous retries.
++func (f *FS) RenameRequest(oldpath, newpath, requestID string) error {
++	return f.vfs.RenameNativeRequest(f.fullPath(oldpath), f.fullPath(newpath), requestID)
+ }
+ 
+ // Remove deletes a file
+ func (f *FS) Remove(filename string) (err error) {
++	release, e := f.vfs.LockMoveMutation()
++	if e != nil {
++		return e
++	}
++	defer release()
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("err=%v", &err)
+ 	return f.vfs.Remove(filename)
+@@ -141,6 +189,11 @@
+ // it does not redirect to VFS.MkDirAll because that one doesn't
+ // honor the permissions
+ func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
++	release, e := f.vfs.LockMoveMutation()
++	if e != nil {
++		return e
++	}
++	defer release()
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "perm=%v", perm)("err=%v", &err)
+ 	parts := strings.Split(filename, "/")
+@@ -148,6 +201,7 @@
+ 		current := strings.Join(parts[:i+1], "/")
+ 		_, err := f.vfs.Stat(current)
+ 		if err == vfs.ENOENT {
++			f.vfs.NotifyMoveCreation(current)
+ 			err = f.vfs.Mkdir(current, perm)
+ 			if err != nil {
+ 				return err
+@@ -159,6 +213,9 @@
+ 
+ // Lstat gets the stats for symlink
+ func (f *FS) Lstat(filename string) (fi os.FileInfo, err error) {
++	if e := f.vfs.CheckMovePath(f.fullPath(filename)); e != nil {
++		return nil, e
++	}
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("fi=%v, err=%v", &fi, &err)
+ 	fi, err = f.vfs.Stat(filename)
+@@ -171,8 +228,14 @@
+ 
+ // Symlink creates a link pointing to target
+ func (f *FS) Symlink(target, link string) (err error) {
++	release, e := f.vfs.LockMoveMutation()
++	if e != nil {
++		return e
++	}
++	defer release()
+ 	link = f.fullPath(link)
+ 	defer log.Trace(target, "link=%q", link)("err=%v", &err)
++	f.vfs.NotifyMoveCreation(link)
+ 	return f.vfs.Symlink(target, link)
+ }
+ 
+@@ -185,6 +248,11 @@
+ 
+ // Chmod changes the file modes
+ func (f *FS) Chmod(name string, mode os.FileMode) (err error) {
++	release, e := f.vfs.LockMoveMutation()
++	if e != nil {
++		return e
++	}
++	defer release()
+ 	name = f.fullPath(name)
+ 	defer log.Trace(name, "mode=%v", mode)("err=%v", &err)
+ 	err = f.vfs.Chmod(name, mode)
+@@ -203,6 +271,11 @@
+ 
+ // Chown changes owner of the file
+ func (f *FS) Chown(name string, uid, gid int) (err error) {
++	release, e := f.vfs.LockMoveMutation()
++	if e != nil {
++		return e
++	}
++	defer release()
+ 	name = f.fullPath(name)
+ 	defer log.Trace(name, "uid=%d, gid=%d", uid, gid)("err=%v", &err)
+ 	err = f.vfs.Chown(name, uid, gid)
+@@ -215,6 +288,11 @@
+ 
+ // Chtimes changes the access time and modified time
+ func (f *FS) Chtimes(name string, atime time.Time, mtime time.Time) (err error) {
++	release, e := f.vfs.LockMoveMutation()
++	if e != nil {
++		return e
++	}
++	defer release()
+ 	name = f.fullPath(name)
+ 	defer log.Trace(name, "atime=%v, mtime=%v", atime, mtime)("err=%v", &err)
+ 	return f.vfs.Chtimes(name, atime, mtime)
+@@ -250,3 +328,19 @@
+ 	_ billy.Filesystem = (*FS)(nil)
+ 	_ billy.Change     = (*FS)(nil)
+ )
++
++// mutationFile holds the namespace lease until a native write handle closes.
++type mutationFile struct {
++	billy.File
++	release func()
++	once    sync.Once
++	err     error
++}
++
++func (f *mutationFile) Close() error {
++	f.once.Do(func() { defer f.release(); f.err = f.File.Close() })
++	return f.err
++}
++
++// RenameManagesHandles indicates that the background move commits native identities.
++func (f *FS) RenameManagesHandles() bool { return f.vfs.Opt.MoveJournal != "" }
+--- a/cmd/serve/nfs/handler.go
++++ b/cmd/serve/nfs/handler.go
+@@ -9,6 +9,7 @@
+ 	"os"
+ 	"path"
+ 	"strings"
++	"sync"
+ 
+ 	"github.com/go-git/go-billy/v5"
+ 	"github.com/rclone/rclone/fs"
+@@ -19,9 +20,10 @@
+ 
+ // Handler returns a NFS backing that exposes a given file system in response to all mount requests.
+ type Handler struct {
+-	vfs     *vfs.VFS
+-	opt     Options
+-	billyFS *FS
++	requestMu sync.RWMutex
++	vfs       *vfs.VFS
++	opt       Options
++	billyFS   *FS
+ 	Cache
+ }
+ 
+@@ -38,6 +40,10 @@
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to make cache: %w", err)
+ 	}
++	vfs.SetMoveNamespaceLocker(func() func() { h.requestMu.Lock(); return h.requestMu.Unlock })
++	vfs.SetMoveHandleRenamer(func(oldPath, newPath string) error {
++		return h.RenameHandles(h.billyFS, strings.Split(oldPath, "/"), strings.Split(newPath, "/"))
++	})
+ 	var level nfs.LogLevel
+ 	switch {
+ 	case ci.LogLevel >= fs.LogLevelDebug: // Debug level, needs -vv
+@@ -315,3 +321,20 @@
+ 	}
+ 	l.logPrintf(fs.LogLevelNotice, format, args...)
+ }
++
++// RenameHandles preserves cached identities after namespace changes.
++func (h *Handler) RenameHandles(f billy.Filesystem, oldPath, newPath []string) error {
++	if h.vfs.MoveWasReplay() {
++		return nil
++	}
++	if c, ok := h.Cache.(nfs.RenameHandler); ok {
++		return c.RenameHandles(f, oldPath, newPath)
++	}
++	return h.Cache.InvalidateHandle(f, h.Cache.ToHandle(f, oldPath))
++}
++
++// BeginRequest excludes renames while another request resolves and uses a handle.
++func (h *Handler) BeginRequest(procedure nfs.NFSProcedure) func() {
++	h.requestMu.RLock()
++	return h.requestMu.RUnlock
++}
+--- /dev/null
++++ b/cmd/serve/nfs/move_responsiveness_test.go
+@@ -0,0 +1,81 @@
++package nfs
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"errors"
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/object"
++	"github.com/rclone/rclone/vfs"
++	"github.com/rclone/rclone/vfs/vfscommon"
++	"github.com/stretchr/testify/require"
++	gonfs "github.com/willscott/go-nfs"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++)
++
++func TestNativeMoveKeepsUnrelatedMetadataResponsive(t *testing.T) {
++	ctx := context.Background()
++	f, e := fs.NewFs(ctx, ":memory:responsive-"+rand.Text())
++	require.NoError(t, e)
++	for _, key := range []string{"Album/a", "Other/keep"} {
++		_, e = f.Put(ctx, bytes.NewBufferString("payload"), object.NewStaticObjectInfo(key, time.Unix(100, 0), 7, true, nil, f))
++		require.NoError(t, e)
++	}
++	opt := vfscommon.Opt
++	opt.MoveJournal = filepath.Join(t.TempDir(), "moves")
++	v := vfs.New(ctx, f, &opt)
++	defer v.Shutdown()
++	handler, e := NewHandler(ctx, v, &Options{HandleLimit: 100})
++	require.NoError(t, e)
++	h := handler.(*Handler)
++	handle := h.ToHandle(h.billyFS, []string{"Album", "a"})
++	entered, finish := make(chan struct{}), make(chan struct{})
++	realCopy := f.Features().Copy
++	f.Features().Copy = func(ctx context.Context, o fs.Object, dst string) (fs.Object, error) {
++		close(entered)
++		<-finish
++		return realCopy(ctx, o, dst)
++	}
++	release := h.BeginRequest(gonfs.NFSProcedureRename)
++	start := time.Now()
++	e = h.billyFS.Rename("Album", "Moved")
++	release()
++	require.ErrorIs(t, e, syscall.EBUSY)
++	require.Less(t, time.Since(start), time.Second)
++	select {
++	case <-entered:
++	case <-time.After(2 * time.Second):
++		t.Fatal("move did not begin")
++	}
++	done := make(chan error, 1)
++	go func() {
++		release := h.BeginRequest(gonfs.NFSProcedureGetAttr)
++		defer release()
++		_, e := h.billyFS.Stat("Other/keep")
++		done <- e
++	}()
++	select {
++	case e := <-done:
++		require.NoError(t, e)
++	case <-time.After(time.Second):
++		t.Fatal("unrelated metadata waited for remote copy")
++	}
++	_, e = h.billyFS.Stat("Album/a")
++	require.ErrorIs(t, e, syscall.EBUSY)
++	close(finish)
++	require.Eventually(t, func() bool {
++		e := h.billyFS.Rename("Album", "Moved")
++		if errors.Is(e, syscall.EBUSY) {
++			return false
++		}
++		require.NoError(t, e)
++		return true
++	}, 5*time.Second, 10*time.Millisecond)
++	_, path, e := h.FromHandle(handle)
++	require.NoError(t, e)
++	require.Equal(t, []string{"Moved", "a"}, path)
++}
+--- /dev/null
++++ b/cmd/serve/nfs/native_replay_test.go
+@@ -0,0 +1,71 @@
++//go:build unix
++
++package nfs
++
++import (
++	"bytes"
++	"crypto/rand"
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/object"
++	"github.com/rclone/rclone/vfs"
++	"github.com/rclone/rclone/vfs/vfscommon"
++	"github.com/stretchr/testify/require"
++)
++
++func TestNativeReplayCreationInvalidation(t *testing.T) {
++	for _, kind := range []string{"create", "open-create", "mkdir"} {
++		t.Run(kind, func(t *testing.T) {
++			ctx := t.Context()
++			remote, err := fs.NewFs(ctx, ":memory:replay-"+rand.Text())
++			require.NoError(t, err)
++			_, err = remote.Put(ctx, bytes.NewBufferString("old"), object.NewStaticObjectInfo("a", time.Unix(100, 0), 3, true, nil, remote))
++			require.NoError(t, err)
++			opt := vfscommon.Opt
++			opt.MoveJournal = filepath.Join(t.TempDir(), "moves")
++			mounted := vfs.New(ctx, remote, &opt)
++			defer mounted.Shutdown()
++			adapter := &FS{vfs: mounted}
++			wait := func() {
++				require.Eventually(t, func() bool { return mounted.MoveStatus()["active"] == false }, 5*time.Second, time.Millisecond)
++			}
++			require.ErrorIs(t, adapter.RenameRequest("a", "b", "xid-first"), syscall.EBUSY)
++			wait()
++			// Unrelated metadata increments the epoch, while a new XID still acknowledges.
++			require.NoError(t, adapter.Chmod("b", 0600))
++			require.NoError(t, adapter.RenameRequest("a", "b", "xid-retry"))
++			switch kind {
++			case "create", "open-create":
++				var fd interface {
++					Write([]byte) (int, error)
++					Close() error
++				}
++				if kind == "create" {
++					fd, err = adapter.Create("a")
++				} else {
++					fd, err = adapter.OpenFile("a", os.O_CREATE|os.O_WRONLY, 0600)
++				}
++				require.NoError(t, err)
++				_, err = fd.Write([]byte("new"))
++				require.NoError(t, err)
++				require.NoError(t, fd.Close())
++			case "mkdir":
++				require.NoError(t, adapter.MkdirAll("a", 0700))
++			}
++			// The original RPC remains idempotent, but a new RPC must validate/re-move.
++			require.NoError(t, adapter.RenameRequest("a", "b", "xid-first"))
++			require.ErrorIs(t, adapter.RenameRequest("a", "b", "xid-new"), syscall.EBUSY)
++			wait()
++			if kind != "mkdir" {
++				require.NoError(t, adapter.RenameRequest("a", "b", "xid-new"))
++				_, err = remote.NewObject(ctx, "a")
++				require.ErrorIs(t, err, fs.ErrorObjectNotFound)
++			}
++		})
++	}
++}
+--- a/vfs/dir.go
++++ b/vfs/dir.go
+@@ -76,6 +76,10 @@
+ }
+ 
+ func (d *Dir) cacheCleanup() {
++	if d.vfs.Opt.MoveJournal != "" {
++		d.vfs.safeMoves.gate.RLock()
++		defer d.vfs.safeMoves.gate.RUnlock()
++	}
+ 	defer func() {
+ 		// We should never panic here
+ 		_ = recover()
+@@ -361,15 +365,31 @@
+ //
+ // path should be the desired path
+ func (d *Dir) renameTree(dirPath string) {
++	d.mu.RLock()
++	parent := d.parent
++	d.mu.RUnlock()
++	if parent != nil {
++		parent.mu.Lock()
++		defer parent.mu.Unlock()
++	}
++	d.renameTreeLocked(dirPath)
++}
++
++// renameTreeLocked requires the parent's mutex when the parent is non-nil.
++func (d *Dir) renameTreeLocked(dirPath string) {
+ 	d.mu.Lock()
+ 	defer d.mu.Unlock()
+ 
+ 	// Make sure the path is correct for each node
+ 	if d.path != dirPath {
+ 		fs.Debugf(d.path, "Renaming to %q", dirPath)
+-		delete(d.parent.items, name(d.path))
++		if d.parent != nil && d.parent.items[name(d.path)] == d {
++			delete(d.parent.items, name(d.path))
++		}
+ 		d.path = dirPath
+-		d.parent.items[name(d.path)] = d
++		if d.parent != nil {
++			d.parent.items[name(d.path)] = d
++		}
+ 		d.entry = fs.NewDirCopy(d.vfs.ctx, d.entry).SetRemote(dirPath)
+ 	}
+ 
+@@ -377,7 +397,7 @@
+ 	for leaf, node := range d.items {
+ 		switch x := node.(type) {
+ 		case *Dir:
+-			x.renameTree(path.Join(dirPath, leaf))
++			x.renameTreeLocked(path.Join(dirPath, leaf))
+ 		case *File:
+ 			x.renameDir(dirPath)
+ 		default:
+@@ -391,21 +411,41 @@
+ // Reset the directory to new state, discarding all the objects and
+ // reading everything again
+ func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
+-	d.ForgetAll()
++	if d.vfs.Opt.MoveJournal == "" {
++		d.ForgetAll()
++	}
+ 
+ 	d.modTimeMu.Lock()
+ 	d.modTime = fsDir.ModTime(d.vfs.ctx)
+ 	d.modTimeMu.Unlock()
+ 	d.mu.Lock()
+ 	oldPath := d.path
++	oldParent := d.parent
+ 	d.parent = newParent
+ 	d.entry = fsDir
+ 	d.path = fsDir.Remote()
+ 	newPath := d.path
+-	delete(d.parent.items, name(oldPath))
+-	d.parent.items[name(d.path)] = d
+ 	d.read = time.Time{}
+ 	d.mu.Unlock()
++	if oldParent == newParent {
++		newParent.mu.Lock()
++		if newParent.items[name(oldPath)] == d {
++			delete(newParent.items, name(oldPath))
++		}
++		newParent.items[name(newPath)] = d
++		newParent.mu.Unlock()
++	} else {
++		if oldParent != nil {
++			oldParent.mu.Lock()
++			if oldParent.items[name(oldPath)] == d {
++				delete(oldParent.items, name(oldPath))
++			}
++			oldParent.mu.Unlock()
++		}
++		newParent.mu.Lock()
++		newParent.items[name(newPath)] = d
++		newParent.mu.Unlock()
++	}
+ 
+ 	// Rename any remaining items in the tree that we couldn't forget
+ 	d.renameTree(d.path)
+@@ -1248,7 +1288,11 @@
+ 		}
+ 		srcRemote := x.Remote()
+ 		dstRemote := newPath
+-		err = operations.DirMove(d.vfs.ctx, d.f, srcRemote, dstRemote)
++		if d.vfs.Opt.MoveJournal != "" && features.DirMove == nil && features.Move == nil && features.Copy != nil {
++			_, err = d.vfs.journalRemoteMove(d.vfs.ctx, srcRemote, dstRemote, true)
++		} else {
++			err = operations.DirMove(d.vfs.ctx, d.f, srcRemote, dstRemote)
++		}
+ 		if err != nil {
+ 			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
+ 			return err
+@@ -1258,6 +1302,14 @@
+ 		if oldNode != nil {
+ 			if oldDir, ok := oldNode.(*Dir); ok {
+ 				fs.Debugf(x, "Updating dir with %v %p", newDir, oldDir)
++				if d.vfs.Opt.MoveJournal != "" {
++					if err = oldDir.refreshRenamedObjects(newPath); err != nil {
++						return err
++					}
++				}
++				if d.vfs.Opt.MoveJournal != "" {
++					d.vfs.beginMoveCommit()
++				}
+ 				oldDir.rename(destDir, newDir)
+ 			}
+ 		}
+--- a/vfs/file.go
++++ b/vfs/file.go
+@@ -196,9 +196,9 @@
+ 
+ // renameDir - call when parent directory has been renamed
+ func (f *File) renameDir(dPath string) {
+-	f.mu.RLock()
++	f.mu.Lock()
+ 	f.dPath = dPath
+-	f.mu.RUnlock()
++	f.mu.Unlock()
+ }
+ 
+ // applyPendingRename runs a previously set rename operation if there are no
+@@ -225,6 +225,8 @@
+ 	d := f.d
+ 	oldPendingRenameFun := f.pendingRenameFun
+ 	oldPath := f._cachePath()
++	oldLeaf := f.leaf
++	oldDPath := f.dPath
+ 	newCacheName := f._fixCachePath(newName)
+ 	f.mu.RUnlock()
+ 
+@@ -260,8 +262,13 @@
+ 			}
+ 
+ 			// do the move of the remote object
+-			dstOverwritten, _ := d.Fs().NewObject(ctx, newPath)
+-			newObject, err = operations.Move(ctx, d.Fs(), dstOverwritten, newPath, o)
++			var dstOverwritten fs.Object
++			if d.vfs.Opt.MoveJournal != "" && d.Fs().Features().Move == nil && d.Fs().Features().Copy != nil {
++				newObject, err = d.vfs.journalRemoteMove(ctx, o.Remote(), newPath, false)
++			} else {
++				dstOverwritten, _ = d.Fs().NewObject(ctx, newPath)
++				newObject, err = operations.Move(ctx, d.Fs(), dstOverwritten, newPath, o)
++			}
+ 			if err != nil {
+ 				fs.Errorf(f.Path(), "File.Rename error: %v", err)
+ 				return err
+@@ -273,6 +280,16 @@
+ 				fs.Errorf(f.Path(), "File.Rename %v", err)
+ 				return err
+ 			}
++		}
++		// Commit native-visible fields only after remote work finishes.
++		if d.vfs.Opt.MoveJournal != "" {
++			d.vfs.beginMoveCommit()
++			dPath := destDir.Path()
++			f.mu.Lock()
++			f.d = destDir
++			f.dPath = dPath
++			f.leaf = newName
++			f.mu.Unlock()
+ 		}
+ 		// Rename in the cache
+ 		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
+@@ -296,9 +313,11 @@
+ 	// rename the file object
+ 	dPath := destDir.Path()
+ 	f.mu.Lock()
+-	f.d = destDir
+-	f.dPath = dPath
+-	f.leaf = newName
++	if d.vfs.Opt.MoveJournal == "" {
++		f.d = destDir
++		f.dPath = dPath
++		f.leaf = newName
++	}
+ 	writing := f._writingInProgress()
+ 	f.mu.Unlock()
+ 
+@@ -315,7 +334,15 @@
+ 		return nil
+ 	}
+ 
+-	return renameCall(ctx)
++	err := renameCall(ctx)
++	if err != nil && d.vfs.Opt.MoveJournal != "" {
++		f.mu.Lock()
++		f.d = d
++		f.dPath = oldDPath
++		f.leaf = oldLeaf
++		f.mu.Unlock()
++	}
++	return err
+ }
+ 
+ // addWriter adds a write handle to the file
+--- /dev/null
++++ b/vfs/move_copy_proof_test.go
+@@ -0,0 +1,151 @@
++package vfs
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/hash"
++	"github.com/stretchr/testify/require"
++)
++
++func TestSafeMovesCopyAcceptsNewDestinationLastModified(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "a", "unchanged bytes")
++	copiedAt := time.Unix(40_000, 123)
++	realCopy := f.Features().Copy
++	f.Features().Copy = func(ctx context.Context, src fs.Object, dst string) (fs.Object, error) {
++		obj, err := realCopy(ctx, src, dst)
++		if err == nil {
++			err = obj.SetModTime(ctx, copiedAt)
++		}
++		return obj, err
++	}
++	_, err := v.journalRemoteMove(context.Background(), "a", "b", false)
++	require.NoError(t, err)
++	entry := v.safeMoves.journal.Objects[0]
++	require.True(t, entry.Verified)
++	require.True(t, entry.Deleted)
++	require.NotNil(t, entry.DestinationModTime)
++	require.True(t, copiedAt.Equal(*entry.DestinationModTime))
++	require.False(t, entry.ModTime.Equal(*entry.DestinationModTime))
++	moveExists(t, f, "a", false)
++	moveExists(t, f, "b", true)
++}
++
++func TestSafeMovesDestinationProofSurvivesRestartAndDetectsTimestampChange(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "Album/a", "alpha")
++	movePut(t, f, "Album/b", "beta")
++	copiedAt := time.Unix(40_000, 0)
++	realCopy := f.Features().Copy
++	var calls atomic.Int32
++	copyWithNewTime := func(ctx context.Context, src fs.Object, dst string) (fs.Object, error) {
++		obj, err := realCopy(ctx, src, dst)
++		if err == nil {
++			err = obj.SetModTime(ctx, copiedAt)
++		}
++		return obj, err
++	}
++	f.Features().Copy = func(ctx context.Context, src fs.Object, dst string) (fs.Object, error) {
++		if calls.Add(1) == 2 {
++			waitForMoveReceipt(t, v.Opt.MoveJournal)
++			return nil, errors.New("injected interruption")
++		}
++		return copyWithNewTime(ctx, src, dst)
++	}
++	_, err := v.journalRemoteMove(context.Background(), "Album", "Moved", true)
++	require.Error(t, err)
++	// Reconstruct the original inventory plus synced receipts, as on restart.
++	raw, err := os.ReadFile(filepath.Join(v.Opt.MoveJournal, "move.json"))
++	require.NoError(t, err)
++	var restored moveJournal
++	require.NoError(t, json.Unmarshal(raw, &restored))
++	require.NoError(t, v.readMoveProgress(&restored))
++	var verified *moveObject
++	for i := range restored.Objects {
++		if restored.Objects[i].Verified {
++			verified = &restored.Objects[i]
++			break
++		}
++	}
++	require.NotNil(t, verified)
++	require.NotNil(t, verified.DestinationModTime)
++	require.True(t, copiedAt.Equal(*verified.DestinationModTime))
++	dst, err := f.NewObject(context.Background(), verified.Destination)
++	require.NoError(t, err)
++	require.True(t, v.destinationMatches(context.Background(), dst, verified))
++	// Same payload and checksum, changed destination identity: no source deletion.
++	require.NoError(t, dst.SetModTime(context.Background(), copiedAt.Add(time.Second)))
++	f.Features().Copy = copyWithNewTime
++	require.ErrorContains(t, v.runMove(context.Background(), &restored), "destination changed")
++	moveExists(t, f, "Album/a", true)
++	moveExists(t, f, "Album/b", true)
++}
++
++func TestSafeMovesLegacyReceiptUsesOriginalTimestamp(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "a", "alpha")
++	ctx := context.Background()
++	src, err := f.NewObject(ctx, "a")
++	require.NoError(t, err)
++	checksum, err := src.Hash(ctx, hash.MD5)
++	require.NoError(t, err)
++	dst, err := f.Features().Copy(ctx, src, "b")
++	require.NoError(t, err)
++	j := &moveJournal{ID: "legacy", Version: 1, Objects: []moveObject{{Source: "a", Destination: "b", Size: src.Size(), ModTime: src.ModTime(ctx), MD5: checksum}}}
++	require.NoError(t, os.MkdirAll(v.Opt.MoveJournal, 0700))
++	receipt, err := json.Marshal(map[string]any{"index": 0, "deleted": false, "destinationMD5": checksum})
++	require.NoError(t, err)
++	require.NoError(t, os.WriteFile(filepath.Join(v.Opt.MoveJournal, "legacy.progress"), append(receipt, '\n'), 0600))
++	require.NoError(t, v.readMoveProgress(j))
++	require.Nil(t, j.Objects[0].DestinationModTime)
++	require.True(t, v.destinationMatches(ctx, dst, &j.Objects[0]))
++	require.NoError(t, dst.SetModTime(ctx, j.Objects[0].ModTime.Add(time.Second)))
++	require.False(t, v.destinationMatches(ctx, dst, &j.Objects[0]))
++	require.NoError(t, dst.SetModTime(ctx, j.Objects[0].ModTime))
++	require.NoError(t, v.runMove(ctx, j))
++	moveExists(t, f, "a", false)
++	moveExists(t, f, "b", true)
++}
++
++func TestSafeMovesFailedCheckpointClearsDestinationProofBeforeRecopy(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "a", "alpha")
++	realCopy := f.Features().Copy
++	f.Features().Copy = func(ctx context.Context, src fs.Object, dst string) (fs.Object, error) {
++		obj, err := realCopy(ctx, src, dst)
++		if err != nil {
++			return nil, err
++		}
++		if err = obj.SetModTime(ctx, time.Unix(40_000, 0)); err != nil {
++			return nil, err
++		}
++		// An invalid receipt path makes checkpoint fail after copy verification.
++		err = os.Mkdir(filepath.Join(v.Opt.MoveJournal, v.safeMoves.journal.ID+".progress"), 0700)
++		return obj, err
++	}
++	_, err := v.journalRemoteMove(context.Background(), "a", "b", false)
++	require.Error(t, err)
++	j := v.safeMoves.journal
++	require.False(t, j.Objects[0].Verified)
++	require.Empty(t, j.Objects[0].DestinationMD5)
++	require.Nil(t, j.Objects[0].DestinationModTime)
++	require.NoError(t, os.Remove(filepath.Join(v.Opt.MoveJournal, j.ID+".progress")))
++	f.Features().Copy = func(ctx context.Context, src fs.Object, dst string) (fs.Object, error) {
++		obj, err := realCopy(ctx, src, dst)
++		if err == nil {
++			err = obj.SetModTime(ctx, time.Unix(50_000, 0))
++		}
++		return obj, err
++	}
++	require.NoError(t, v.runMove(context.Background(), j))
++	require.True(t, j.Objects[0].DestinationModTime.Equal(time.Unix(50_000, 0)))
++	moveExists(t, f, "a", false)
++}
+--- /dev/null
++++ b/vfs/move_requests.go
+@@ -0,0 +1,98 @@
++package vfs
++
++import (
++	"context"
++	"sync"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"golang.org/x/sync/errgroup"
++)
++
++const moveMetadataTimeout = 30 * time.Second
++const moveCopyTimeout = 5 * time.Minute
++const moveMetadataConcurrency = 8
++const movePayloadConcurrency = 4
++
++// moveRequest bounds one remote request group rather than the duration of a tree.
++func moveRequest[T any](ctx context.Context, timeout time.Duration, request func(context.Context) (T, error)) (T, error) {
++	requestCtx, cancel := context.WithTimeout(ctx, timeout)
++	defer cancel()
++	value, err := request(requestCtx)
++	if err == nil {
++		err = requestCtx.Err()
++	}
++	return value, err
++}
++
++func moveRequestError(ctx context.Context, timeout time.Duration, request func(context.Context) error) error {
++	_, err := moveRequest(ctx, timeout, func(requestCtx context.Context) (struct{}, error) { return struct{}{}, request(requestCtx) })
++	return err
++}
++
++// moveParallel waits for all admitted work before reporting an uncertain outcome.
++func moveParallel(ctx context.Context, count, limit int, task func(context.Context, int) error) error {
++	group, taskCtx := errgroup.WithContext(ctx)
++	work := make(chan int)
++	for worker := 0; worker < limit && worker < count; worker++ {
++		group.Go(func() error {
++			for index := range work {
++				if err := taskCtx.Err(); err != nil {
++					return err
++				}
++				if err := task(taskCtx, index); err != nil {
++					return err
++				}
++			}
++			return nil
++		})
++	}
++	group.Go(func() error {
++		defer close(work)
++		for index := 0; index < count; index++ {
++			select {
++			case work <- index:
++			case <-taskCtx.Done():
++				return taskCtx.Err()
++			}
++		}
++		return nil
++	})
++	return group.Wait()
++}
++
++// moveListingFS gives each directory listing its own deadline. The recursive
++// ListR feature is disabled so a large tree does not inherit one global timeout.
++type moveListingFS struct {
++	fs.Fs
++	features fs.Features
++}
++
++func newMoveListingFS(f fs.Fs) *moveListingFS {
++	wrapper := &moveListingFS{Fs: f, features: *f.Features()}
++	wrapper.features.ListR = nil
++	return wrapper
++}
++func (f *moveListingFS) Features() *fs.Features { return &f.features }
++func (f *moveListingFS) List(ctx context.Context, dir string) (fs.DirEntries, error) {
++	return moveRequest(ctx, moveMetadataTimeout, func(requestCtx context.Context) (fs.DirEntries, error) { return f.Fs.List(requestCtx, dir) })
++}
++
++// moveReceipts serializes append/fsync and progress publication. Different
++// workers may mutate distinct objects, but never the same receipt log together.
++type moveReceipts struct {
++	mu        sync.Mutex
++	completed int
++}
++
++func (r *moveReceipts) advance(vfs *VFS, phase string, total int) {
++	r.completed++
++	vfs.movePhase(phase, r.completed, total)
++}
++
++// moveCopyProof records identity observed on the newly copied destination.
++// LastModified need not equal the source when custom mtime is absent.
++type moveCopyProof struct {
++	checksum string
++	modTime  time.Time
++}
+--- /dev/null
++++ b/vfs/move_requests_test.go
+@@ -0,0 +1,146 @@
++package vfs
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/hash"
++	"github.com/stretchr/testify/require"
++)
++
++type measuredMoveFS struct {
++	fs.Fs
++	features                  fs.Features
++	metadataActive            atomic.Int32
++	metadataPeak              atomic.Int32
++	copyActive                atomic.Int32
++	copyPeak                  atomic.Int32
++	copied                    atomic.Int32
++	deleted                   atomic.Int32
++	deletionBeforeCopyBarrier atomic.Bool
++	listedMetadataCalls       atomic.Int32
++	expected                  int32
++}
++
++func movePeak(value *atomic.Int32, candidate int32) {
++	for old := value.Load(); candidate > old; old = value.Load() {
++		if value.CompareAndSwap(old, candidate) {
++			return
++		}
++	}
++}
++func measuredDelay(ctx context.Context, duration time.Duration) error {
++	timer := time.NewTimer(duration)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++func (f *measuredMoveFS) Features() *fs.Features { return &f.features }
++func (f *measuredMoveFS) NewObject(ctx context.Context, key string) (fs.Object, error) {
++	active := f.metadataActive.Add(1)
++	defer f.metadataActive.Add(-1)
++	movePeak(&f.metadataPeak, active)
++	if err := measuredDelay(ctx, time.Millisecond); err != nil {
++		return nil, err
++	}
++	o, err := f.Fs.NewObject(ctx, key)
++	if err != nil {
++		return nil, err
++	}
++	return &measuredMoveObject{Object: o, owner: f}, nil
++}
++func (f *measuredMoveFS) List(ctx context.Context, dir string) (fs.DirEntries, error) {
++	entries, err := f.Fs.List(ctx, dir)
++	for i, entry := range entries {
++		if o, ok := entry.(fs.Object); ok {
++			entries[i] = &listedMoveObject{Object: o, owner: f}
++		}
++	}
++	return entries, err
++}
++
++type listedMoveObject struct {
++	fs.Object
++	owner *measuredMoveFS
++}
++
++func (o *listedMoveObject) ModTime(ctx context.Context) time.Time {
++	o.owner.listedMetadataCalls.Add(1)
++	return o.Object.ModTime(ctx)
++}
++func (o *listedMoveObject) Hash(ctx context.Context, kind hash.Type) (string, error) {
++	o.owner.listedMetadataCalls.Add(1)
++	return o.Object.Hash(ctx, kind)
++}
++
++type measuredMoveObject struct {
++	fs.Object
++	owner *measuredMoveFS
++}
++
++func (o *measuredMoveObject) Remove(ctx context.Context) error {
++	if o.owner.copied.Load() != o.owner.expected {
++		o.owner.deletionBeforeCopyBarrier.Store(true)
++	}
++	err := o.Object.Remove(ctx)
++	if err == nil {
++		o.owner.deleted.Add(1)
++	}
++	return err
++}
++
++func TestSafeMovesBoundedParallelInventoryAndCopyBarrier(t *testing.T) {
++	v, base := moveFixture(t)
++	const count = 128
++	for i := 0; i < count; i++ {
++		movePut(t, base, fmt.Sprintf("Album/Sub%02d/file-%03d", i/8, i), "synthetic")
++	}
++	f := &measuredMoveFS{Fs: base, features: *base.Features(), expected: count}
++	realCopy := base.Features().Copy
++	f.features.Copy = func(ctx context.Context, o fs.Object, key string) (fs.Object, error) {
++		active := f.copyActive.Add(1)
++		defer f.copyActive.Add(-1)
++		movePeak(&f.copyPeak, active)
++		if err := measuredDelay(ctx, 5*time.Millisecond); err != nil {
++			return nil, err
++		}
++		if wrapped, ok := o.(*measuredMoveObject); ok {
++			o = wrapped.Object
++		}
++		copied, err := realCopy(ctx, o, key)
++		if err == nil {
++			f.copied.Add(1)
++		}
++		return copied, err
++	}
++	v.f = f
++	_, err := v.journalRemoteMove(context.Background(), "Album", "Moved", true)
++	require.NoError(t, err)
++	require.Zero(t, f.listedMetadataCalls.Load(), "inventory callback must not fetch ModTime/hash metadata under the walk lock")
++	require.GreaterOrEqual(t, f.metadataPeak.Load(), int32(2))
++	require.LessOrEqual(t, f.metadataPeak.Load(), int32(moveMetadataConcurrency))
++	require.GreaterOrEqual(t, f.copyPeak.Load(), int32(2))
++	require.LessOrEqual(t, f.copyPeak.Load(), int32(movePayloadConcurrency))
++	require.Equal(t, int32(count), f.copied.Load())
++	require.Equal(t, int32(count), f.deleted.Load())
++	require.False(t, f.deletionBeforeCopyBarrier.Load())
++	moveExists(t, base, "Album/Sub00/file-000", false)
++	moveExists(t, base, "Moved/Sub00/file-000", true)
++}
++
++func TestMoveRequestDeadlineCancelsStalledMetadata(t *testing.T) {
++	started := time.Now()
++	_, err := moveRequest(context.Background(), 10*time.Millisecond, func(ctx context.Context) (struct{}, error) { <-ctx.Done(); return struct{}{}, ctx.Err() })
++	require.ErrorIs(t, err, context.DeadlineExceeded)
++	require.Less(t, time.Since(started), time.Second)
++	require.False(t, errors.Is(err, context.Canceled))
++}
+--- /dev/null
++++ b/vfs/native_moves.go
+@@ -0,0 +1,183 @@
++package vfs
++
++import (
++	"errors"
++	"strings"
++	"syscall"
++)
++
++type nativeMove struct {
++	source, destination string
++	requestID           string
++	pathValid           bool
++	errorDelivered      bool
++	done                bool
++	err                 error
++	epoch               uint64
++}
++
++const nativeMoveHistoryLimit = 256
++
++// RenameNative is the path-based API. A mutation epoch prevents a completed
++// result from acknowledging a newly created object at the same source path.
++func (vfs *VFS) RenameNative(source, destination string) error {
++	return vfs.RenameNativeRequest(source, destination, "")
++}
++
++// RenameNativeRequest lets a protocol retransmission retain its original result
++// even when subsequent, unrelated moves have replaced the active job.
++func (vfs *VFS) RenameNativeRequest(source, destination, requestID string) error {
++	if vfs.Opt.MoveJournal == "" {
++		return vfs.Rename(source, destination)
++	}
++	source = strings.Trim(source, "/")
++	destination = strings.Trim(destination, "/")
++	if !movePath(source) || !movePath(destination) {
++		return syscall.EINVAL
++	}
++	m := &vfs.safeMoves
++	m.mu.Lock()
++	vfs.loadMove()
++	for i := len(m.nativeHistory) - 1; i >= 0; i-- {
++		job := m.nativeHistory[i]
++		if job.source == source && job.destination == destination &&
++			((requestID != "" && job.requestID == requestID) ||
++				(job.pathValid && (requestID != "" || job.epoch == m.epoch))) {
++			m.replayed = true
++			m.mu.Unlock()
++			return nil
++		}
++	}
++	if job := m.native; job != nil {
++		if !job.done {
++			m.mu.Unlock()
++			return syscall.EBUSY
++		}
++		if job.source == source && job.destination == destination && job.err != nil {
++			// Finder may change XID when retrying JUKEBOX. Deliver this job's
++			// terminal error before treating a later call as a fresh attempt.
++			// Retained journal failures remain blocked until explicit recovery.
++			if m.pending || !job.errorDelivered {
++				job.errorDelivered = true
++				err := job.err
++				if errors.Is(err, syscall.EBUSY) {
++					err = syscall.EIO // a finished job must leave the JUKEBOX retry loop
++				}
++				m.mu.Unlock()
++				return err
++			}
++		}
++	}
++	if m.loadError != nil || m.pending || m.active {
++		m.mu.Unlock()
++		return syscall.EIO
++	}
++	// A new rename may recreate a previous source.
++	// Retain RPC-specific results, but expire ambiguous path-only outcomes.
++	for i := range m.nativeHistory {
++		old := &m.nativeHistory[i]
++		if moveUnder(source, old.source) || moveUnder(old.source, source) ||
++			moveUnder(destination, old.source) || moveUnder(old.source, destination) {
++			old.pathValid = false
++		}
++	}
++	job := &nativeMove{source: source, destination: destination, requestID: requestID}
++	m.native = job
++	m.phase = "preparing"
++	m.completed = 0
++	m.total = 0
++	m.problem = ""
++	m.mu.Unlock()
++	go func() {
++		err := vfs.Rename(source, destination)
++		m.mu.Lock()
++		defer m.mu.Unlock()
++		job.done = true
++		job.err = err
++		job.epoch = m.epoch
++		if err != nil && !m.pending {
++			m.phase = "failed"
++			if m.problem == "" {
++				m.problem = "Move could not finish. Check storage access and try again."
++			}
++			if err == syscall.EBUSY {
++				m.problem = "Close open files or wait for uploads to finish, then try the move again."
++			}
++		}
++		if err == nil {
++			m.rememberNativeMove(job)
++		}
++	}()
++	return syscall.EBUSY
++}
++
++// rememberNativeMove is called with m.mu held after durable completion.
++func (m *safeMoveState) rememberNativeMove(job *nativeMove) {
++	job.pathValid = true
++	m.nativeHistory = append(m.nativeHistory, *job)
++	if len(m.nativeHistory) > nativeMoveHistoryLimit {
++		copy(m.nativeHistory, m.nativeHistory[len(m.nativeHistory)-nativeMoveHistoryLimit:])
++		m.nativeHistory = m.nativeHistory[:nativeMoveHistoryLimit]
++	}
++}
++
++// NotifyMoveCreation invalidates path-based completion replay before a native
++// mutation can recreate a moved source. Call under the mutation lease. Protocol
++// transaction-specific results remain available for actual retransmissions.
++func (vfs *VFS) NotifyMoveCreation(name string) {
++	name = strings.Trim(name, "/")
++	m := &vfs.safeMoves
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	for i := range m.nativeHistory {
++		job := &m.nativeHistory[i]
++		if moveUnder(name, job.source) || moveUnder(job.source, name) {
++			job.pathValid = false
++		}
++	}
++}
++
++// CheckMovePath keeps affected native objects retryable without stalling unrelated browsing.
++func (vfs *VFS) CheckMovePath(name string) error {
++	name = strings.Trim(name, "/")
++	m := &vfs.safeMoves
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	vfs.loadMove()
++	if m.loadError != nil {
++		return syscall.EIO
++	}
++	if j := m.native; j != nil && !j.done {
++		if moveUnder(name, j.source) || moveUnder(name, j.destination) {
++			return syscall.EBUSY
++		}
++	}
++	if m.pending && m.journal != nil {
++		if moveUnder(name, m.journal.Source) || moveUnder(name, m.journal.Destination) {
++			if m.active {
++				return syscall.EBUSY
++			}
++			// No background job can resolve this state until explicit Resume.
++			// Return a terminal error so Finder does not retry JUKEBOX forever.
++			return syscall.EIO
++		}
++	}
++	return nil
++}
++
++// beginMoveCommit excludes native handle resolution only for the in-memory commit.
++// The move gate protects commitRelease until endMoveCommit.
++func (vfs *VFS) beginMoveCommit() {
++	m := &vfs.safeMoves
++	if m.commitRelease == nil && m.namespaceLock != nil {
++		m.commitRelease = m.namespaceLock()
++	}
++}
++func (vfs *VFS) endMoveCommit() {
++	m := &vfs.safeMoves
++	if m.commitRelease != nil {
++		release := m.commitRelease
++		m.commitRelease = nil
++		release()
++	}
++}
+--- /dev/null
++++ b/vfs/native_moves_test.go
+@@ -0,0 +1,269 @@
++package vfs
++
++import (
++	"context"
++	"crypto/rand"
++	"errors"
++	"github.com/rclone/rclone/vfs/vfscommon"
++	"io"
++	"path/filepath"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/stretchr/testify/require"
++)
++
++func nativeWait(t *testing.T, v *VFS) error {
++	t.Helper()
++	var result error
++	require.Eventually(t, func() bool {
++		m := &v.safeMoves
++		m.mu.Lock()
++		defer m.mu.Unlock()
++		if m.native == nil || !m.native.done {
++			return false
++		}
++		result = m.native.err
++		return true
++	}, 5*time.Second, time.Millisecond)
++	return result
++}
++
++func TestNativeMoveRetainsInterleavedCompletion(t *testing.T) {
++	for _, rpc := range []bool{false, true} {
++		t.Run(map[bool]string{false: "path", true: "rpc"}[rpc], func(t *testing.T) {
++			v, f := moveFixture(t)
++			movePut(t, f, "a", "alpha")
++			movePut(t, f, "c", "charlie")
++			idA, idC := "", ""
++			if rpc {
++				idA, idC = "rpc-a", "rpc-c"
++			}
++			require.ErrorIs(t, v.RenameNativeRequest("a", "b", idA), syscall.EBUSY)
++			require.NoError(t, nativeWait(t, v))
++			// A's successful RPC has not been acknowledged when C starts and finishes.
++			require.ErrorIs(t, v.RenameNativeRequest("c", "d", idC), syscall.EBUSY)
++			require.NoError(t, nativeWait(t, v))
++			require.NoError(t, v.RenameNativeRequest("c", "d", idC))
++			require.NoError(t, v.RenameNativeRequest("a", "b", idA))
++			moveExists(t, f, "a", false)
++			moveExists(t, f, "b", true)
++		})
++	}
++}
++
++func TestNativeMoveRetriesRepairedPreflight(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "a", "alpha")
++	movePut(t, f, "b", "blocker")
++	// Force a non-journaled destination validation failure.
++	movePut(t, f, "folder/item", "nested")
++	require.ErrorIs(t, v.RenameNativeRequest("folder", "b", "rpc"), syscall.EBUSY)
++	terminal := nativeWait(t, v)
++	require.Error(t, terminal)
++	require.ErrorIs(t, v.RenameNativeRequest("folder", "b", "changed-rpc"), terminal)
++	require.Equal(t, false, v.MoveStatus()["needsRecovery"])
++	obj, err := f.NewObject(context.Background(), "b")
++	require.NoError(t, err)
++	require.NoError(t, obj.Remove(context.Background()))
++	v.root.ForgetAll()
++	require.ErrorIs(t, v.RenameNativeRequest("folder", "b", "rpc"), syscall.EBUSY)
++	require.NoError(t, nativeWait(t, v))
++	require.NoError(t, v.RenameNativeRequest("folder", "b", "rpc"))
++}
++
++func TestNativeMoveDoesNotAcknowledgeRecreatedSource(t *testing.T) {
++	for _, rpc := range []bool{false, true} {
++		t.Run(map[bool]string{false: "path", true: "rpc"}[rpc], func(t *testing.T) {
++			v, f := moveFixture(t)
++			movePut(t, f, "a", "original")
++			id := ""
++			if rpc {
++				id = "rpc-original"
++			}
++			require.ErrorIs(t, v.RenameNativeRequest("a", "b", id), syscall.EBUSY)
++			require.NoError(t, nativeWait(t, v))
++			release, err := v.LockMoveMutation()
++			require.NoError(t, err)
++			v.NotifyMoveCreation("a")
++			movePut(t, f, "a", "new")
++			v.root.ForgetAll()
++			release()
++			// An old RPC can still be retransmitted, but a new RPC must do real work.
++			if rpc {
++				require.NoError(t, v.RenameNativeRequest("a", "b", id))
++				id = "rpc-new"
++			}
++			require.ErrorIs(t, v.RenameNativeRequest("a", "b", id), syscall.EBUSY)
++			require.NoError(t, nativeWait(t, v))
++			obj, err := f.NewObject(context.Background(), "a")
++			require.ErrorIs(t, err, fs.ErrorObjectNotFound)
++			require.Nil(t, obj)
++		})
++	}
++}
++
++func TestNativeMoveHistoryBounded(t *testing.T) {
++	m := safeMoveState{}
++	for i := 0; i < nativeMoveHistoryLimit*2; i++ {
++		m.rememberNativeMove(&nativeMove{epoch: uint64(i)})
++	}
++	require.Len(t, m.nativeHistory, nativeMoveHistoryLimit)
++	require.Equal(t, uint64(nativeMoveHistoryLimit), m.nativeHistory[0].epoch)
++}
++
++func TestNativeMovePathReplayExpiresWhenRenameRecreatesSource(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "a", "original")
++	movePut(t, f, "c", "replacement")
++	require.ErrorIs(t, v.RenameNative("a", "b"), syscall.EBUSY)
++	require.NoError(t, nativeWait(t, v))
++	require.ErrorIs(t, v.RenameNative("c", "a"), syscall.EBUSY)
++	require.NoError(t, nativeWait(t, v))
++	require.NoError(t, v.RenameNative("c", "a"))
++	require.ErrorIs(t, v.RenameNative("a", "b"), syscall.EBUSY)
++	require.NoError(t, nativeWait(t, v))
++	moveExists(t, f, "a", false)
++	obj, err := f.NewObject(context.Background(), "b")
++	require.NoError(t, err)
++	reader, err := obj.Open(context.Background())
++	require.NoError(t, err)
++	defer reader.Close()
++	payload, err := io.ReadAll(reader)
++	require.NoError(t, err)
++	require.Equal(t, "replacement", string(payload))
++}
++
++func TestNativeMoveDurableFailureRequiresResume(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "a", "alpha")
++	realCopy := f.Features().Copy
++	var calls atomic.Int32
++	injected := errors.New("temporarily disconnected")
++	f.Features().Copy = func(ctx context.Context, obj fs.Object, dst string) (fs.Object, error) {
++		calls.Add(1)
++		return nil, injected
++	}
++	require.ErrorIs(t, v.RenameNativeRequest("a", "b", "rpc"), syscall.EBUSY)
++	require.ErrorIs(t, nativeWait(t, v), injected)
++	require.Equal(t, true, v.MoveStatus()["needsRecovery"])
++	require.ErrorIs(t, v.RenameNativeRequest("a", "b", "rpc"), injected)
++	require.Equal(t, int32(1), calls.Load())
++	f.Features().Copy = realCopy
++	require.NoError(t, v.ResumeMove())
++	require.Eventually(t, func() bool { return v.MoveStatus()["active"] == false }, 5*time.Second, time.Millisecond)
++	require.NoError(t, v.RenameNativeRequest("a", "b", "rpc"))
++	moveExists(t, f, "a", false)
++	moveExists(t, f, "b", true)
++}
++
++func TestNativeMoveChangedXIDAfterUnrelatedMutation(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "a", "alpha")
++	require.ErrorIs(t, v.RenameNativeRequest("a", "b", "xid-1"), syscall.EBUSY)
++	require.NoError(t, nativeWait(t, v))
++	release, err := v.LockMoveMutation()
++	require.NoError(t, err)
++	// Finder metadata calls may advance the global epoch between JUKEBOX retries.
++	v.NotifyMoveCreation("unrelated")
++	movePut(t, f, "unrelated", "metadata")
++	release()
++	v.NotifyMoveCreation("b/.DS_Store")
++	require.NoError(t, v.RenameNativeRequest("a", "b", "xid-2"))
++	require.NoError(t, v.RenameNativeRequest("a", "b", "xid-3"))
++	moveExists(t, f, "a", false)
++	moveExists(t, f, "b", true)
++}
++
++type nativeFailMetadataFS struct {
++	fs.Fs
++	fail  atomic.Bool
++	calls atomic.Int32
++}
++
++var errNativeMetadata = errors.New("metadata connection unavailable")
++
++func (f *nativeFailMetadataFS) List(ctx context.Context, dir string) (fs.DirEntries, error) {
++	f.calls.Add(1)
++	if f.fail.Load() {
++		return nil, errNativeMetadata
++	}
++	return f.Fs.List(ctx, dir)
++}
++
++func TestNativeMoveReportsTerminalMetadataErrorBeforeFreshAttempt(t *testing.T) {
++	ctx := context.Background()
++	backend, err := fs.NewFs(ctx, ":memory:native-errors-"+rand.Text())
++	require.NoError(t, err)
++	movePut(t, backend, "a", "alpha")
++	remote := &nativeFailMetadataFS{Fs: backend}
++	remote.fail.Store(true)
++	opt := vfscommon.Opt
++	opt.MoveJournal = filepath.Join(t.TempDir(), "moves")
++	v := New(ctx, remote, &opt)
++	defer v.Shutdown()
++	require.ErrorIs(t, v.RenameNativeRequest("a", "b", "first-xid"), syscall.EBUSY)
++	require.ErrorIs(t, nativeWait(t, v), errNativeMetadata)
++	requests := remote.calls.Load()
++	require.Greater(t, requests, int32(0))
++	// The very next retry returns a terminal error without launching more I/O,
++	// even though Finder changed its transaction ID and the server is still down.
++	require.ErrorIs(t, v.RenameNativeRequest("a", "b", "retry-xid"), errNativeMetadata)
++	require.Equal(t, requests, remote.calls.Load())
++	require.Equal(t, false, v.MoveStatus()["active"])
++	require.Equal(t, false, v.MoveStatus()["needsRecovery"])
++	// A fresh user attempt can succeed after repair, without a mutation epoch bump.
++	remote.fail.Store(false)
++	require.ErrorIs(t, v.RenameNativeRequest("a", "b", "new-attempt"), syscall.EBUSY)
++	require.NoError(t, nativeWait(t, v))
++	require.NoError(t, v.RenameNativeRequest("a", "b", "new-attempt-retry"))
++	moveExists(t, backend, "a", false)
++	moveExists(t, backend, "b", true)
++}
++
++func TestNativeMoveFinishedBusyIsTerminal(t *testing.T) {
++	v, _ := moveFixture(t)
++	v.safeMoves.native = &nativeMove{source: "a", destination: "b", done: true, err: syscall.EBUSY}
++	require.ErrorIs(t, v.RenameNativeRequest("a", "b", "retry-xid"), syscall.EIO)
++	require.True(t, v.safeMoves.native.errorDelivered)
++}
++
++func TestNativeMoveGuardsTerminateInactiveRecoveryRequests(t *testing.T) {
++	for _, mode := range []string{"active-native", "active-resume", "retained", "corrupt"} {
++		t.Run(mode, func(t *testing.T) {
++			v, _ := moveFixture(t)
++			m := &v.safeMoves
++			m.loaded = true
++			m.pending = true
++			m.journal = &moveJournal{Source: "Album", Destination: "Moved"}
++			expected := error(syscall.EIO)
++			switch mode {
++			case "active-native":
++				m.native = &nativeMove{source: "Album", destination: "Moved"}
++				expected = syscall.EBUSY
++			case "active-resume":
++				m.active = true
++				expected = syscall.EBUSY
++			case "corrupt":
++				m.loadError = errors.New("invalid journal")
++			}
++			for _, path := range []string{"Album", "Album/a", "Moved", "Moved/a"} {
++				require.ErrorIs(t, v.CheckMovePath(path), expected)
++			}
++			if mode == "corrupt" {
++				require.ErrorIs(t, v.CheckMovePath("Other/file"), syscall.EIO)
++			} else {
++				require.NoError(t, v.CheckMovePath("Other/file"))
++			}
++			release, err := v.LockMoveMutation()
++			require.ErrorIs(t, err, expected)
++			require.Nil(t, release)
++			// Failed guards must release the gate; explicit recovery can still reserve it.
++			require.True(t, m.gate.TryLock())
++			m.gate.Unlock()
++		})
++	}
++}
+--- /dev/null
++++ b/vfs/safe_moves.go
+@@ -0,0 +1,919 @@
++package vfs
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path"
++	"path/filepath"
++	"sort"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/hash"
++	"github.com/rclone/rclone/fs/rc"
++	"github.com/rclone/rclone/fs/walk"
++)
++
++const moveObjectLimit = 10000
++const moveJournalLimit = 32 << 20
++
++type moveObject struct {
++	DestinationMD5     string     `json:"destinationMD5"`
++	DestinationModTime *time.Time `json:"destinationModTime,omitempty"`
++	Source             string     `json:"source"`
++	Destination        string     `json:"destination"`
++	Size               int64      `json:"size"`
++	ModTime            time.Time  `json:"modTime"`
++	MD5                string     `json:"md5"`
++	Verified           bool       `json:"verified"`
++	Deleted            bool       `json:"deleted"`
++}
++
++type moveJournal struct {
++	ID          string       `json:"id"`
++	Version     int          `json:"version"`
++	Binding     string       `json:"binding"`
++	Source      string       `json:"source"`
++	Destination string       `json:"destination"`
++	Directory   bool         `json:"directory"`
++	Complete    bool         `json:"complete"`
++	Objects     []moveObject `json:"objects"`
++	Directories []string     `json:"directories"`
++}
++
++type safeMoveState struct {
++	native        *nativeMove
++	nativeHistory []nativeMove
++	epoch         uint64
++	commitRelease func()
++	replayed      bool
++	pending       bool
++	gate          sync.RWMutex
++	mu            sync.Mutex
++	loaded        bool
++	loadError     error
++	active        bool
++	phase         string
++	completed     int
++	total         int
++	problem       string
++	journal       *moveJournal
++	onResume      func(string, string) error
++	namespaceLock func() func()
++}
++
++func (vfs *VFS) moveBinding() string {
++	if vfs.Opt.MoveBinding != "" {
++		return vfs.Opt.MoveBinding
++	}
++	b := sha256.Sum256([]byte(fs.ConfigString(vfs.f)))
++	return hex.EncodeToString(b[:])
++}
++
++func movePath(p string) bool {
++	return p != "" && len(p) <= 4096 && p != "." && p != ".." && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "../") && path.Clean(p) == p && !strings.ContainsRune(p, 0)
++}
++func moveUnder(p, prefix string) bool { return p == prefix || strings.HasPrefix(p, prefix+"/") }
++
++// loadMove is called with moves.mu held. Corrupt or foreign records fail closed.
++func (vfs *VFS) loadMove() {
++	m := &vfs.safeMoves
++	if m.loaded {
++		return
++	}
++	m.loaded = true
++	if vfs.Opt.MoveJournal == "" {
++		return
++	}
++	filename := filepath.Join(vfs.Opt.MoveJournal, "move.json")
++	info, err := os.Lstat(filename)
++	if errors.Is(err, os.ErrNotExist) {
++		return
++	}
++	if err == nil && (!info.Mode().IsRegular() || info.Size() > moveJournalLimit) {
++		err = fmt.Errorf("invalid move record")
++	}
++	var data []byte
++	if err == nil {
++		data, err = os.ReadFile(filename)
++	}
++	var j moveJournal
++	if err == nil {
++		err = json.Unmarshal(data, &j)
++	}
++	if err == nil && (j.Version != 1 || len(j.ID) != 32 || strings.ContainsAny(j.ID, "/\\.") || j.Binding != vfs.moveBinding() || !movePath(j.Source) || !movePath(j.Destination) || len(j.Objects) > moveObjectLimit || len(j.Directories) > moveObjectLimit) {
++		err = fmt.Errorf("invalid move binding")
++	}
++	if err == nil {
++		for _, o := range j.Objects {
++			if !movePath(o.Source) || !movePath(o.Destination) || !moveUnder(o.Source, j.Source) || o.Destination != j.Destination+strings.TrimPrefix(o.Source, j.Source) || o.Size < 0 {
++				err = fmt.Errorf("invalid move entry")
++				break
++			}
++		}
++		for _, d := range j.Directories {
++			if !movePath(d) || !moveUnder(d, j.Source) {
++				err = fmt.Errorf("invalid move directory")
++				break
++			}
++		}
++	}
++	if err != nil {
++		m.loadError = err
++		m.problem = "Move records could not be validated. Preserve them and use recovery."
++		return
++	}
++	if err = vfs.readMoveProgress(&j); err != nil {
++		m.loadError = err
++		m.problem = "Move progress records could not be validated. Preserve them and use recovery."
++		return
++	}
++	m.journal = &j
++	m.pending = !j.Complete
++	m.total = len(j.Objects)
++	if j.Complete {
++		m.phase = "completed"
++		m.completed = m.total
++	} else {
++		m.phase = "needsRecovery"
++		m.problem = "An interrupted move needs to finish. Choose Resume move."
++	}
++}
++
++// saveMove atomically and durably replaces a private destination-bound record.
++func (vfs *VFS) saveMove(j *moveJournal) error {
++	data, err := json.Marshal(j)
++	if err != nil {
++		return err
++	}
++	if len(data) > moveJournalLimit {
++		return fmt.Errorf("move exceeds record limit")
++	}
++	dir := vfs.Opt.MoveJournal
++	if err = os.MkdirAll(dir, 0700); err != nil {
++		return err
++	}
++	info, err := os.Lstat(dir)
++	if err != nil {
++		return err
++	}
++	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0077 != 0 {
++		return fmt.Errorf("move directory must be private")
++	}
++	f, err := os.CreateTemp(dir, ".move-")
++	if err != nil {
++		return err
++	}
++	defer os.Remove(f.Name())
++	if _, err = f.Write(data); err == nil {
++		err = f.Sync()
++	}
++	closeErr := f.Close()
++	if err == nil {
++		err = closeErr
++	}
++	if err != nil {
++		return err
++	}
++	if err = os.Rename(f.Name(), filepath.Join(dir, "move.json")); err != nil {
++		return err
++	}
++	d, err := os.Open(dir)
++	if err != nil {
++		return err
++	}
++	defer d.Close()
++	return d.Sync()
++}
++
++func (vfs *VFS) movePhase(phase string, completed, total int) {
++	m := &vfs.safeMoves
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	m.phase = phase
++	m.completed = completed
++	m.total = total
++}
++
++// MoveStatus returns bounded move activity independently of the upload queue.
++func (vfs *VFS) MoveStatus() rc.Params {
++	m := &vfs.safeMoves
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	vfs.loadMove()
++	pending := m.loadError != nil || m.pending
++	active := m.active || (m.native != nil && !m.native.done)
++	phase := m.phase
++	if phase == "" {
++		phase = "idle"
++	}
++	if active && phase != "preparing" && phase != "copying" && phase != "verifying" && phase != "removing" {
++		phase = "preparing"
++	}
++	return rc.Params{"version": 1, "enabled": vfs.Opt.MoveJournal != "", "active": active, "needsRecovery": pending && !active, "phase": phase, "completed": m.completed, "total": m.total, "message": m.problem}
++}
++
++// LockMoveMutation excludes native writers during a rename or recovery.
++// The caller must release the returned lock after the file is closed.
++func (vfs *VFS) LockMoveMutation() (func(), error) {
++	m := &vfs.safeMoves
++	if !m.gate.TryRLock() {
++		return nil, syscall.EBUSY
++	}
++	m.mu.Lock()
++	vfs.loadMove()
++	var blocked error
++	if m.active || (m.native != nil && !m.native.done) {
++		blocked = syscall.EBUSY
++	} else if m.loadError != nil || m.pending {
++		blocked = syscall.EIO
++	}
++	if blocked == nil {
++		m.epoch++
++	}
++	m.mu.Unlock()
++	if blocked != nil {
++		m.gate.RUnlock()
++		return nil, blocked
++	}
++	return m.gate.RUnlock, nil
++}
++
++// SetMoveNamespaceLocker coordinates recovery with native handle resolution.
++func (vfs *VFS) SetMoveNamespaceLocker(fn func() func()) { vfs.safeMoves.namespaceLock = fn }
++
++// SetMoveHandleRenamer installs the native handler's recovery callback before serving.
++func (vfs *VFS) SetMoveHandleRenamer(fn func(string, string) error) { vfs.safeMoves.onResume = fn }
++
++func (vfs *VFS) safeRename(oldName, newName string, rename func() error) (err error) {
++	m := &vfs.safeMoves
++	m.gate.Lock()
++	defer m.gate.Unlock()
++	defer vfs.endMoveCommit()
++	m.mu.Lock()
++	vfs.loadMove()
++	if m.loadError != nil || m.pending {
++		m.mu.Unlock()
++		return syscall.EBUSY
++	}
++	previous := m.journal
++	m.replayed = false
++	m.mu.Unlock()
++	oldName = strings.Trim(oldName, "/")
++	newName = strings.Trim(newName, "/")
++	if !movePath(oldName) || !movePath(newName) {
++		return syscall.EINVAL
++	}
++	node, err := vfs.Stat(oldName)
++	if err != nil {
++		if errors.Is(err, os.ErrNotExist) && previous != nil && previous.Complete && previous.Source == oldName && previous.Destination == newName {
++			for i := range previous.Objects {
++				r := &previous.Objects[i]
++				o, e := vfs.f.NewObject(vfs.ctx, r.Destination)
++				if e != nil {
++					return e
++				}
++				if !vfs.destinationMatches(vfs.ctx, o, r) {
++					return fmt.Errorf("completed destination changed")
++				}
++			}
++			m.mu.Lock()
++			m.replayed = true
++			m.mu.Unlock()
++			return nil
++		}
++		return err
++	}
++	if oldName == newName {
++		return nil
++	}
++	if node.IsDir() && moveUnder(newName, oldName) {
++		return syscall.EINVAL
++	}
++	dest, statErr := vfs.Stat(newName)
++	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
++		return statErr
++	}
++	if dest != nil && dest.Path() != node.Path() {
++		if node.IsDir() != dest.IsDir() {
++			if dest.IsDir() {
++				return syscall.EISDIR
++			}
++			return syscall.ENOTDIR
++		}
++		if dest.IsDir() {
++			children, e := dest.(*Dir).ReadDirAll()
++			if e != nil {
++				return e
++			}
++			if len(children) > 0 {
++				return syscall.ENOTEMPTY
++			}
++		}
++	}
++	if vfs.cache != nil && (vfs.cache.BusyMovePrefix(oldName) || vfs.cache.BusyMovePrefix(newName)) {
++		return syscall.EBUSY
++	}
++	m.mu.Lock()
++	m.active = true
++	m.problem = ""
++	m.phase = "preparing"
++	m.completed = 0
++	m.total = 0
++	m.mu.Unlock()
++	defer func() {
++		m.mu.Lock()
++		m.active = false
++		if err != nil {
++			m.phase = "failed"
++			if m.pending {
++				m.phase = "needsRecovery"
++				m.problem = "Move stopped before all steps finished. Choose Resume move."
++				if errors.Is(err, context.DeadlineExceeded) {
++					m.problem = "A storage request timed out. Check the connection, then choose Resume move."
++				}
++			} else {
++				m.problem = "Move could not finish. Check the destination and try again."
++				if errors.Is(err, context.DeadlineExceeded) {
++					m.problem = "A storage request timed out. Check the connection and try the move again."
++				}
++			}
++		}
++		m.mu.Unlock()
++		vfs.noteMetadataChange(oldName, node.IsDir())
++		vfs.noteMetadataChange(newName, node.IsDir())
++	}()
++	if features := vfs.f.Features(); features.Copy == nil || features.Move != nil || features.DirMove != nil {
++		vfs.beginMoveCommit()
++	}
++	err = rename()
++	if err == nil {
++		vfs.beginMoveCommit()
++		if m.onResume != nil {
++			if e := m.onResume(oldName, newName); e != nil {
++				return e
++			}
++		}
++		m.mu.Lock()
++		j := m.journal
++		m.mu.Unlock()
++		if j != nil && !j.Complete {
++			j.Complete = true
++			if e := vfs.saveMove(j); e != nil {
++				j.Complete = false
++				return e
++			}
++		}
++		m.mu.Lock()
++		m.pending = false
++		m.active = false
++		m.mu.Unlock()
++		vfs.root.touchMoveDirectories()
++		vfs.movePhase("completed", m.total, m.total)
++	}
++	return err
++}
++
++func (vfs *VFS) objectMatches(ctx context.Context, o fs.Object, r *moveObject) bool {
++	if o.Size() != r.Size || !o.ModTime(ctx).Equal(r.ModTime) {
++		return false
++	}
++	if r.MD5 != "" {
++		h, e := o.Hash(ctx, hash.MD5)
++		return e == nil && h == r.MD5
++	}
++	return true
++}
++
++// journalRemoteMove copies every object before deleting any source object.
++func (vfs *VFS) journalRemoteMove(ctx context.Context, source, destination string, directory bool) (fs.Object, error) {
++	id := make([]byte, 16)
++	if _, err := rand.Read(id); err != nil {
++		return nil, err
++	}
++	j := &moveJournal{ID: hex.EncodeToString(id), Version: 1, Binding: vfs.moveBinding(), Source: source, Destination: destination, Directory: directory}
++	if directory {
++		// Walk callbacks run under the walker's coordinator lock. Collect keys
++		// only; metadata HEADs are fetched independently after the walk finishes.
++		err := walk.Walk(ctx, newMoveListingFS(vfs.f), source, true, -1, func(dir string, entries fs.DirEntries, listErr error) error {
++			if listErr != nil {
++				return listErr
++			}
++			if len(j.Directories) >= moveObjectLimit {
++				return fmt.Errorf("too many directories in move")
++			}
++			j.Directories = append(j.Directories, dir)
++			for _, entry := range entries {
++				if o, ok := entry.(fs.Object); ok {
++					if len(j.Objects) >= moveObjectLimit {
++						return fmt.Errorf("too many objects in move")
++					}
++					j.Objects = append(j.Objects, moveObject{Source: o.Remote(), Destination: destination + strings.TrimPrefix(o.Remote(), source)})
++				}
++			}
++			vfs.movePhase("preparing", 0, len(j.Objects))
++			return nil
++		})
++		if err != nil {
++			return nil, err
++		}
++		sort.Strings(j.Directories)
++	} else {
++		j.Objects = []moveObject{{Source: source, Destination: destination}}
++	}
++	prepared := &moveReceipts{}
++	vfs.movePhase("preparing", 0, len(j.Objects))
++	if err := moveParallel(ctx, len(j.Objects), moveMetadataConcurrency, func(taskCtx context.Context, index int) error {
++		r := &j.Objects[index]
++		_, err := moveRequest(taskCtx, moveMetadataTimeout, func(requestCtx context.Context) (struct{}, error) {
++			o, err := vfs.f.NewObject(requestCtx, r.Source)
++			if err != nil {
++				return struct{}{}, err
++			}
++			r.Size = o.Size()
++			if r.Size < 0 {
++				return struct{}{}, fmt.Errorf("source size is unknown")
++			}
++			r.ModTime = o.ModTime(requestCtx)
++			r.MD5, _ = o.Hash(requestCtx, hash.MD5)
++			return struct{}{}, nil
++		})
++		if err != nil {
++			return err
++		}
++		prepared.mu.Lock()
++		prepared.advance(vfs, "preparing", len(j.Objects))
++		prepared.mu.Unlock()
++		return nil
++	}); err != nil {
++		return nil, err
++	}
++	// Reserve checksum growth before publishing an inventory or copying objects.
++	initial, err := json.Marshal(j)
++	if err != nil {
++		return nil, err
++	}
++	if len(initial)+128*len(j.Objects) > moveJournalLimit {
++		return nil, fmt.Errorf("move exceeds record limit")
++	}
++	m := &vfs.safeMoves
++	m.mu.Lock()
++	m.journal = j
++	m.pending = true
++	m.total = len(j.Objects)
++	m.mu.Unlock()
++	// Publication can succeed even when the following directory fsync fails.
++	// Treat every persistence error as unresolved until an explicit retry.
++	if err := vfs.saveMove(j); err != nil {
++		return nil, err
++	}
++	if err := vfs.runMove(ctx, j); err != nil {
++		return nil, err
++	}
++	if !directory {
++		return moveRequest(ctx, moveMetadataTimeout, func(requestCtx context.Context) (fs.Object, error) { return vfs.f.NewObject(requestCtx, destination) })
++	}
++	return nil, nil
++}
++
++func (vfs *VFS) runMove(ctx context.Context, j *moveJournal) error {
++	for index, d := range j.Directories {
++		if err := moveRequestError(ctx, moveMetadataTimeout, func(requestCtx context.Context) error {
++			return vfs.f.Mkdir(requestCtx, j.Destination+strings.TrimPrefix(d, j.Source))
++		}); err != nil {
++			return err
++		}
++		vfs.movePhase("preparing", index+1, len(j.Directories))
++	}
++	copied := &moveReceipts{}
++	vfs.movePhase("copying", 0, len(j.Objects))
++	if err := moveParallel(ctx, len(j.Objects), movePayloadConcurrency, func(taskCtx context.Context, index int) error {
++		r := &j.Objects[index]
++		if r.Verified {
++			copied.mu.Lock()
++			copied.advance(vfs, "copying", len(j.Objects))
++			copied.mu.Unlock()
++			return nil
++		}
++		src, err := moveRequest(taskCtx, moveMetadataTimeout, func(requestCtx context.Context) (fs.Object, error) {
++			src, e := vfs.f.NewObject(requestCtx, r.Source)
++			if e != nil {
++				return nil, e
++			}
++			if !vfs.objectMatches(requestCtx, src, r) {
++				return nil, fmt.Errorf("source changed")
++			}
++			return src, nil
++		})
++		if err != nil {
++			return err
++		}
++		// Unverified objects may be recopied after an uncertain response or
++		// failed checkpoint. Never compare a fresh copy to stale destination proof.
++		r.DestinationMD5 = ""
++		r.DestinationModTime = nil
++		dst, err := moveRequest(taskCtx, moveCopyTimeout, func(requestCtx context.Context) (fs.Object, error) {
++			return vfs.f.Features().Copy(requestCtx, src, r.Destination)
++		})
++		if err != nil {
++			return err
++		}
++		proof, err := moveRequest(taskCtx, moveMetadataTimeout, func(requestCtx context.Context) (moveCopyProof, error) {
++			if dst == nil || dst.Size() != r.Size {
++				return moveCopyProof{}, fmt.Errorf("copy verification failed")
++			}
++			checksum, e := dst.Hash(requestCtx, hash.MD5)
++			if e != nil && !errors.Is(e, hash.ErrUnsupported) {
++				return moveCopyProof{}, e
++			}
++			if checksum != "" && r.MD5 != "" && checksum != r.MD5 {
++				return moveCopyProof{}, fmt.Errorf("copy checksum verification failed")
++			}
++			// S3 objects without custom mtime use LastModified. Copy changes
++			// that timestamp legitimately; retain the destination's own identity.
++			return moveCopyProof{checksum: checksum, modTime: dst.ModTime(requestCtx)}, nil
++		})
++		if err != nil {
++			return err
++		}
++		copied.mu.Lock()
++		defer copied.mu.Unlock()
++		r.DestinationMD5 = proof.checksum
++		r.DestinationModTime = &proof.modTime
++		r.Verified = true
++		if err := vfs.checkpointMove(j, index, false); err != nil {
++			r.Verified = false
++			r.DestinationMD5 = ""
++			r.DestinationModTime = nil
++			return err
++		}
++		copied.advance(vfs, "copying", len(j.Objects))
++		return nil
++	}); err != nil {
++		return err
++	}
++	// No deletion task is admitted until every copy and receipt has completed.
++	// Validate the complete remaining source/destination set before admitting
++	// deletion work; a known changed destination must not trigger other deletes.
++	deletionSources := make([]fs.Object, len(j.Objects))
++	checked := &moveReceipts{}
++	vfs.movePhase("verifying", 0, len(j.Objects))
++	if err := moveParallel(ctx, len(j.Objects), moveMetadataConcurrency, func(taskCtx context.Context, index int) error {
++		r := &j.Objects[index]
++		if !r.Deleted {
++			src, err := moveRequest(taskCtx, moveMetadataTimeout, func(requestCtx context.Context) (fs.Object, error) {
++				dst, e := vfs.f.NewObject(requestCtx, r.Destination)
++				if e != nil {
++					return nil, e
++				}
++				if !vfs.destinationMatches(requestCtx, dst, r) {
++					return nil, fmt.Errorf("destination changed before source removal")
++				}
++				src, e := vfs.f.NewObject(requestCtx, r.Source)
++				if e == nil {
++					if !vfs.objectMatches(requestCtx, src, r) {
++						return nil, fmt.Errorf("source changed before removal")
++					}
++					return src, nil
++				}
++				if !errors.Is(e, fs.ErrorObjectNotFound) {
++					return nil, e
++				}
++				return nil, nil
++			})
++			if err != nil {
++				return err
++			}
++			deletionSources[index] = src
++		}
++		checked.mu.Lock()
++		checked.advance(vfs, "verifying", len(j.Objects))
++		checked.mu.Unlock()
++		return nil
++	}); err != nil {
++		return err
++	}
++	removed := &moveReceipts{}
++	vfs.movePhase("removing", 0, len(j.Objects))
++	if err := moveParallel(ctx, len(j.Objects), movePayloadConcurrency, func(taskCtx context.Context, index int) error {
++		r := &j.Objects[index]
++		if r.Deleted {
++			removed.mu.Lock()
++			removed.advance(vfs, "removing", len(j.Objects))
++			removed.mu.Unlock()
++			return nil
++		}
++		if src := deletionSources[index]; src != nil {
++			if err := moveRequestError(taskCtx, moveMetadataTimeout, src.Remove); err != nil {
++				return err
++			}
++		}
++		removed.mu.Lock()
++		defer removed.mu.Unlock()
++		r.Deleted = true
++		if err := vfs.checkpointMove(j, index, true); err != nil {
++			r.Deleted = false
++			return err
++		}
++		removed.advance(vfs, "removing", len(j.Objects))
++		return nil
++	}); err != nil {
++		return err
++	}
++	for index := len(j.Directories) - 1; index >= 0; index-- {
++		if err := moveRequestError(ctx, moveMetadataTimeout, func(requestCtx context.Context) error {
++			err := vfs.f.Rmdir(requestCtx, j.Directories[index])
++			if errors.Is(err, fs.ErrorDirNotFound) {
++				return nil
++			}
++			return err
++		}); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// ResumeMove reserves one recovery task; polling the status never starts mutations.
++func (vfs *VFS) ResumeMove() error {
++	m := &vfs.safeMoves
++	if !m.gate.TryLock() {
++		return syscall.EBUSY
++	}
++	m.mu.Lock()
++	vfs.loadMove()
++	if m.loadError != nil || m.journal == nil || !m.pending || m.active || vfs.f.Features().Copy == nil {
++		m.mu.Unlock()
++		m.gate.Unlock()
++		return fmt.Errorf("no resumable move")
++	}
++	j := m.journal
++	m.active = true
++	m.phase = "preparing"
++	m.problem = ""
++	m.replayed = false
++	m.mu.Unlock()
++	m.gate.Unlock()
++	go func() {
++		m.gate.Lock()
++		defer m.gate.Unlock()
++		defer vfs.endMoveCommit()
++		ctx := vfs.ctx
++		err := vfs.saveMove(j)
++		if err == nil {
++			err = vfs.runMove(ctx, j)
++		}
++		if err == nil {
++			vfs.beginMoveCommit()
++		}
++		if err == nil && m.onResume != nil {
++			err = m.onResume(j.Source, j.Destination)
++		}
++		if err == nil {
++			j.Complete = true
++			err = vfs.saveMove(j)
++			if err != nil {
++				j.Complete = false
++			}
++		}
++		vfs.beginMoveCommit()
++		vfs.root.ForgetAll()
++		vfs.noteMetadataChange(j.Source, j.Directory)
++		vfs.noteMetadataChange(j.Destination, j.Directory)
++		m.mu.Lock()
++		defer m.mu.Unlock()
++		m.active = false
++		if err != nil {
++			m.phase = "needsRecovery"
++			m.problem = "Move could not resume. Check connection and permissions, then retry."
++		} else {
++			m.pending = false
++			m.phase = "completed"
++			if m.native != nil {
++				m.native.done = true
++				m.native.err = nil
++				m.native.epoch = m.epoch
++				m.rememberNativeMove(m.native)
++			}
++			m.completed = len(j.Objects)
++			m.problem = ""
++		}
++	}()
++	return nil
++}
++
++func init() {
++	rc.Add(rc.Call{Path: "vfs/moves", NoAuth: false, Title: "Read move activity or resume a retained move.", Fn: func(ctx context.Context, in rc.Params) (rc.Params, error) {
++		v, err := getVFS(in)
++		if err != nil {
++			return nil, err
++		}
++		if _, ok := in["resume"]; ok {
++			resume, e := in.GetBool("resume")
++			if e != nil || !resume {
++				return nil, fmt.Errorf("resume must be true")
++			}
++			if e = v.ResumeMove(); e != nil {
++				return nil, e
++			}
++		}
++		return v.MoveStatus(), nil
++	}})
++}
++
++// moveReceipt is a constant-size, synced append after each verified copy/delete.
++// Keeping receipts separate avoids rewriting the whole tree for every object.
++type moveReceipt struct {
++	DestinationMD5     string     `json:"destinationMD5"`
++	DestinationModTime *time.Time `json:"destinationModTime,omitempty"`
++	Index              int        `json:"index"`
++	Deleted            bool       `json:"deleted"`
++}
++
++func (vfs *VFS) checkpointMove(j *moveJournal, index int, deleted bool) error {
++	filename := filepath.Join(vfs.Opt.MoveJournal, j.ID+".progress")
++	f, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	info, err := f.Stat()
++	if err != nil {
++		return err
++	}
++	if info.Size() > moveJournalLimit {
++		return fmt.Errorf("progress log too large")
++	}
++	if info.Size() > 0 {
++		last := make([]byte, 1)
++		if _, err = f.ReadAt(last, info.Size()-1); err != nil {
++			return err
++		}
++		if last[0] != '\n' {
++			data := make([]byte, info.Size())
++			if _, err = f.ReadAt(data, 0); err != nil {
++				return err
++			}
++			if err = f.Truncate(int64(bytes.LastIndexByte(data, '\n') + 1)); err != nil {
++				return err
++			}
++		}
++	}
++	data, err := json.Marshal(moveReceipt{Index: index, Deleted: deleted, DestinationMD5: j.Objects[index].DestinationMD5, DestinationModTime: j.Objects[index].DestinationModTime})
++	if err != nil {
++		return err
++	}
++	if _, err = f.Write(append(data, '\n')); err != nil {
++		return err
++	}
++	if err = f.Sync(); err != nil {
++		return err
++	}
++	d, err := os.Open(vfs.Opt.MoveJournal)
++	if err != nil {
++		return err
++	}
++	defer d.Close()
++	return d.Sync()
++}
++func (vfs *VFS) readMoveProgress(j *moveJournal) error {
++	if j.Complete {
++		return nil
++	}
++	filename := filepath.Join(vfs.Opt.MoveJournal, j.ID+".progress")
++	info, err := os.Lstat(filename)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	if !info.Mode().IsRegular() || info.Size() > moveJournalLimit {
++		return fmt.Errorf("invalid progress log")
++	}
++	f, err := os.Open(filename)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	reader := bufio.NewReader(f)
++	for {
++		line, readErr := reader.ReadBytes('\n')
++		if readErr == io.EOF {
++			break
++		}
++		if readErr != nil {
++			return readErr
++		}
++		var r moveReceipt
++		if err = json.Unmarshal(line, &r); err != nil {
++			return err
++		}
++		if r.Index < 0 || r.Index >= len(j.Objects) {
++			return fmt.Errorf("invalid receipt index")
++		}
++		o := &j.Objects[r.Index]
++		if r.Deleted && !o.Verified {
++			return fmt.Errorf("delete receipt without verification")
++		}
++		if r.DestinationModTime != nil || !o.Verified {
++			o.DestinationModTime = r.DestinationModTime
++		}
++		o.Verified = true
++		o.DestinationMD5 = r.DestinationMD5
++		if r.Deleted {
++			o.Deleted = true
++		}
++	}
++	return nil
++}
++
++// refreshRenamedObjects retains cached node identities while rebinding remote objects.
++// Remote lookups happen outside directory/file locks.
++func (d *Dir) refreshRenamedObjects(newPath string) error {
++	d.mu.RLock()
++	children := make(map[string]Node, len(d.items))
++	for name, node := range d.items {
++		children[name] = node
++	}
++	d.mu.RUnlock()
++	for name, node := range children {
++		target := path.Join(newPath, name)
++		switch x := node.(type) {
++		case *Dir:
++			if err := x.refreshRenamedObjects(target); err != nil {
++				return err
++			}
++		case *File:
++			o, err := moveRequest(d.vfs.ctx, moveMetadataTimeout, func(ctx context.Context) (fs.Object, error) { return d.f.NewObject(ctx, target) })
++			if err != nil {
++				return err
++			}
++			x.mu.Lock()
++			x.o = o
++			x.mu.Unlock()
++		}
++	}
++	return nil
++}
++
++// destinationMatches uses available checksums without treating multipart ETags as MD5.
++// A successful server-side copy receipt plus size/mtime is retained when no common hash exists.
++func (vfs *VFS) destinationMatches(ctx context.Context, o fs.Object, r *moveObject) bool {
++	// Older verified v1 records passed the original source-mtime comparison,
++	// so the source snapshot remains their expected destination timestamp.
++	expected := r.ModTime
++	if r.DestinationModTime != nil {
++		expected = *r.DestinationModTime
++	}
++	if o.Size() != r.Size || !o.ModTime(ctx).Equal(expected) {
++		return false
++	}
++	h, err := o.Hash(ctx, hash.MD5)
++	if r.DestinationMD5 != "" {
++		return err == nil && h == r.DestinationMD5
++	}
++	if h != "" && r.MD5 != "" {
++		return err == nil && h == r.MD5
++	}
++	return err == nil || errors.Is(err, hash.ErrUnsupported)
++}
++
++// MoveWasReplay prevents a completed RPC retry from invalidating destination handles.
++func (vfs *VFS) MoveWasReplay() bool {
++	m := &vfs.safeMoves
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return m.replayed
++}
++
++// touchMoveDirectories gives cached native identities a fresh grace period after
++// a long namespace operation without declaring unread directories populated.
++func (d *Dir) touchMoveDirectories() {
++	d.mu.Lock()
++	if !d.read.IsZero() {
++		d.read = time.Now()
++	}
++	var children []*Dir
++	for _, node := range d.items {
++		if child, ok := node.(*Dir); ok {
++			children = append(children, child)
++		}
++	}
++	d.mu.Unlock()
++	for _, child := range children {
++		child.touchMoveDirectories()
++	}
++}
+--- /dev/null
++++ b/vfs/safe_moves_cleanup_test.go
+@@ -0,0 +1,46 @@
++package vfs
++
++import (
++	"context"
++	"github.com/rclone/rclone/fs"
++	"github.com/stretchr/testify/require"
++	"testing"
++	"time"
++)
++
++func TestSafeMovesCleanupCannotDiscardMovingIdentities(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "Album/a", "alpha")
++	before, e := v.Stat("Album/a")
++	require.NoError(t, e)
++	entered, finish := make(chan struct{}), make(chan struct{})
++	realCopy := f.Features().Copy
++	f.Features().Copy = func(ctx context.Context, o fs.Object, dst string) (fs.Object, error) {
++		close(entered)
++		<-finish
++		return realCopy(ctx, o, dst)
++	}
++	renamed := make(chan error, 1)
++	go func() { renamed <- v.Rename("Album", "Renamed") }()
++	<-entered
++	v.root.mu.Lock()
++	v.root.read = time.Now().Add(-time.Hour)
++	v.root.mu.Unlock()
++	cleaned := make(chan struct{})
++	go func() { v.root.cacheCleanup(); close(cleaned) }()
++	select {
++	case <-cleaned:
++		t.Error("cleanup ran during an active namespace move")
++	case <-time.After(20 * time.Millisecond):
++	}
++	close(finish)
++	require.NoError(t, <-renamed)
++	select {
++	case <-cleaned:
++	case <-time.After(time.Second):
++		t.Fatal("cleanup remained blocked after rename")
++	}
++	after, e := v.Stat("Renamed/a")
++	require.NoError(t, e)
++	require.Equal(t, before.Inode(), after.Inode())
++}
+--- /dev/null
++++ b/vfs/safe_moves_test.go
+@@ -0,0 +1,196 @@
++package vfs
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"errors"
++	_ "github.com/rclone/rclone/backend/memory"
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/object"
++	"github.com/rclone/rclone/vfs/vfscommon"
++	"github.com/stretchr/testify/require"
++	"os"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func moveFixture(t *testing.T) (*VFS, fs.Fs) {
++	t.Helper()
++	f, e := fs.NewFs(context.Background(), ":memory:clouddrive-"+rand.Text())
++	require.NoError(t, e)
++	opt := vfscommon.Opt
++	opt.MoveJournal = filepath.Join(t.TempDir(), "moves")
++	opt.CaseInsensitive = false
++	v := New(context.Background(), f, &opt)
++	t.Cleanup(v.Shutdown)
++	return v, f
++}
++func movePut(t *testing.T, f fs.Fs, key string, payload string) {
++	t.Helper()
++	_, e := f.Put(context.Background(), bytes.NewBufferString(payload), object.NewStaticObjectInfo(key, time.Unix(100, 0), int64(len(payload)), true, nil, f))
++	require.NoError(t, e)
++}
++func moveExists(t *testing.T, f fs.Fs, key string, want bool) {
++	t.Helper()
++	_, e := f.NewObject(context.Background(), key)
++	if want {
++		require.NoError(t, e)
++	} else {
++		require.ErrorIs(t, e, fs.ErrorObjectNotFound)
++	}
++}
++func TestSafeMovesCopyBeforeDeleteAndRestart(t *testing.T) {
++	v, f := moveFixture(t)
++	ctx := context.Background()
++	movePut(t, f, "Album/a", "alpha")
++	movePut(t, f, "Album/Sub/b", "beta")
++	movePut(t, f, "Target/keep", "keep")
++	realCopy := f.Features().Copy
++	var n atomic.Int32
++	f.Features().Copy = func(ctx context.Context, o fs.Object, dst string) (fs.Object, error) {
++		if n.Add(1) == 2 {
++			waitForMoveReceipt(t, v.Opt.MoveJournal)
++			return nil, errors.New("injected copy failure")
++		}
++		return realCopy(ctx, o, dst)
++	}
++	require.Error(t, v.Rename("Album", "Target/Album"))
++	moveExists(t, f, "Album/a", true)
++	moveExists(t, f, "Album/Sub/b", true)
++	require.Equal(t, true, v.MoveStatus()["needsRecovery"])
++	_, e := v.LockMoveMutation()
++	require.Error(t, e)
++	f.Features().Copy = realCopy
++	// A torn final append must not invalidate prior synced verification receipts.
++	logPath := filepath.Join(v.Opt.MoveJournal, v.safeMoves.journal.ID+".progress")
++	log, e := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0600)
++	require.NoError(t, e)
++	_, e = log.WriteString("{\"index\":")
++	require.NoError(t, e)
++	require.NoError(t, log.Close())
++	// A new controller must discover the durable incomplete record.
++	fresh := &VFS{f: f, ctx: ctx, Opt: v.Opt, root: v.root}
++	require.Equal(t, true, fresh.MoveStatus()["needsRecovery"])
++	require.NoError(t, fresh.ResumeMove())
++	require.Eventually(t, func() bool { return fresh.MoveStatus()["active"] == false }, 5*time.Second, 10*time.Millisecond)
++	require.Equal(t, false, fresh.MoveStatus()["needsRecovery"])
++	moveExists(t, f, "Album/a", false)
++	moveExists(t, f, "Album/Sub/b", false)
++	moveExists(t, f, "Target/Album/a", true)
++	moveExists(t, f, "Target/Album/Sub/b", true)
++}
++func TestSafeMovesNamespaceAndReplay(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "Album/a", "alpha")
++	movePut(t, f, "Target/keep", "keep")
++	require.Error(t, v.Rename("Album", "Album/Sub"))
++	require.Error(t, v.Rename("Album", "Target"))
++	moveExists(t, f, "Album/a", true)
++	moveExists(t, f, "Target/keep", true)
++	before, e := v.Stat("Album/a")
++	require.NoError(t, e)
++	require.NoError(t, v.Rename("Album", "Renamed"))
++	after, e := v.Stat("Renamed/a")
++	require.NoError(t, e)
++	require.Equal(t, before.Inode(), after.Inode())
++	require.NoError(t, v.Rename("Album", "Renamed"), "lost-response replay")
++	moveExists(t, f, "Renamed/a", true)
++}
++func TestSafeMovesCorruptRecordsFailClosed(t *testing.T) {
++	v, _ := moveFixture(t)
++	require.NoError(t, os.MkdirAll(v.Opt.MoveJournal, 0700))
++	require.NoError(t, os.WriteFile(filepath.Join(v.Opt.MoveJournal, "move.json"), []byte("{"), 0600))
++	require.Equal(t, true, v.MoveStatus()["needsRecovery"])
++	_, e := v.LockMoveMutation()
++	require.Error(t, e)
++	require.Error(t, v.ResumeMove())
++}
++func TestSafeMovesChangedSourcePreserved(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "a", "old")
++	realCopy := f.Features().Copy
++	f.Features().Copy = func(ctx context.Context, o fs.Object, dst string) (fs.Object, error) {
++		copied, e := realCopy(ctx, o, dst)
++		movePut(t, f, "a", "changed")
++		return copied, e
++	}
++	require.Error(t, v.Rename("a", "b"))
++	moveExists(t, f, "a", true)
++	moveExists(t, f, "b", true)
++	require.Equal(t, true, v.MoveStatus()["needsRecovery"])
++}
++
++func TestSafeMovesChangedDestinationNeverDeletesSource(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "Album/a", "alpha")
++	movePut(t, f, "Album/b", "beta")
++	realCopy := f.Features().Copy
++	var n atomic.Int32
++	f.Features().Copy = func(ctx context.Context, o fs.Object, dst string) (fs.Object, error) {
++		if n.Add(1) == 2 {
++			waitForMoveReceipt(t, v.Opt.MoveJournal)
++			return nil, errors.New("injected")
++		}
++		return realCopy(ctx, o, dst)
++	}
++	require.Error(t, v.Rename("Album", "Renamed"))
++	f.Features().Copy = realCopy
++	var first moveObject
++	for _, entry := range v.safeMoves.journal.Objects {
++		if entry.Verified {
++			first = entry
++			break
++		}
++	}
++	require.NotEmpty(t, first.Source)
++	movePut(t, f, first.Destination, "changed")
++	require.NoError(t, v.ResumeMove())
++	require.Eventually(t, func() bool { return v.MoveStatus()["active"] == false }, 5*time.Second, time.Millisecond*10)
++	require.Equal(t, true, v.MoveStatus()["needsRecovery"])
++	moveExists(t, f, "Album/a", true)
++	moveExists(t, f, "Album/b", true)
++}
++
++func TestSafeMovesPersistenceFailureBlocksMutationUntilExplicitResume(t *testing.T) {
++	v, f := moveFixture(t)
++	movePut(t, f, "a", "alpha")
++	v.MoveStatus() // Capture the empty initial state before storage becomes unavailable.
++	require.NoError(t, os.WriteFile(v.Opt.MoveJournal, []byte("not a directory"), 0600))
++	require.Error(t, v.Rename("a", "b"))
++	moveExists(t, f, "a", true)
++	moveExists(t, f, "b", false)
++	require.Equal(t, true, v.MoveStatus()["needsRecovery"])
++	_, e := v.LockMoveMutation()
++	require.Error(t, e)
++	require.NoError(t, v.ResumeMove())
++	require.Eventually(t, func() bool { return v.MoveStatus()["active"] == false }, time.Second, time.Millisecond*10)
++	require.Equal(t, true, v.MoveStatus()["needsRecovery"])
++	moveExists(t, f, "a", true)
++	moveExists(t, f, "b", false)
++	require.NoError(t, os.Remove(v.Opt.MoveJournal))
++	require.NoError(t, v.ResumeMove())
++	require.Eventually(t, func() bool { return v.MoveStatus()["active"] == false }, time.Second, time.Millisecond*10)
++	require.Equal(t, false, v.MoveStatus()["needsRecovery"])
++	moveExists(t, f, "a", false)
++	moveExists(t, f, "b", true)
++}
++
++// waitForMoveReceipt ensures injected parallel-copy failure happens after one
++// worker has reached its local durable-receipt section.
++func waitForMoveReceipt(t *testing.T, directory string) {
++	t.Helper()
++	deadline := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline) {
++		paths, _ := filepath.Glob(filepath.Join(directory, "*.progress"))
++		for _, p := range paths {
++			if info, e := os.Stat(p); e == nil && info.Size() > 0 {
++				return
++			}
++		}
++		time.Sleep(time.Millisecond)
++	}
++	t.Error("copy-failure fixture never observed a verified receipt")
++}
+--- a/vfs/vfs.go
++++ b/vfs/vfs.go
+@@ -178,6 +178,7 @@
+ 
+ // VFS represents the top level filing system
+ type VFS struct {
++	safeMoves       safeMoveState
+ 	metadataChanges metadataChanges
+ 	f               fs.Fs
+ 	ctx             context.Context
+@@ -648,6 +649,13 @@
+ 
+ // Rename oldName to newName
+ func (vfs *VFS) Rename(oldName, newName string) error {
++	if vfs.Opt.MoveJournal != "" {
++		return vfs.safeRename(oldName, newName, func() error { return vfs.rename(oldName, newName) })
++	}
++	return vfs.rename(oldName, newName)
++}
++
++func (vfs *VFS) rename(oldName, newName string) error {
+ 	// find the parent directories
+ 	oldDir, oldLeaf, err := vfs.StatParent(oldName)
+ 	if err != nil {
+--- a/vfs/vfscache/cache.go
++++ b/vfs/vfscache/cache.go
+@@ -913,3 +913,15 @@
+ 	}
+ 	return c.avFn(remote, size, isDir)
+ }
++
++// BusyMovePrefix reports dirty or open payloads before a directory rename.
++func (c *Cache) BusyMovePrefix(prefix string) bool {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	for name, item := range c.item {
++		if (name == prefix || strings.HasPrefix(name, prefix+"/")) && (item.IsDirty() || item.inUse()) {
++			return true
++		}
++	}
++	return false
++}
+--- a/vfs/vfscommon/options.go
++++ b/vfs/vfscommon/options.go
+@@ -11,6 +11,10 @@
+ 
+ // OptionsInfo describes the Options in use
+ var OptionsInfo = fs.Options{{
++	Name: "vfs_move_binding", Default: "", Help: "Stable destination identity for native move records", Groups: "VFS",
++}, {
++	Name: "vfs_move_journal", Default: "", Help: "Private journal directory for recoverable native moves", Groups: "VFS",
++}, {
+ 	Name:    "no_modtime",
+ 	Default: false,
+ 	Help:    "Don't read/write the modification time (can speed things up)",
+@@ -183,6 +187,8 @@
+ 
+ // Options is options for creating the vfs
+ type Options struct {
++	MoveBinding        string        `config:"vfs_move_binding"`
++	MoveJournal        string        `config:"vfs_move_journal"`
+ 	NoSeek             bool          `config:"no_seek"`        // don't allow seeking if set
+ 	NoChecksum         bool          `config:"no_checksum"`    // don't check checksums if set
+ 	ReadOnly           bool          `config:"read_only"`      // if set VFS is read only

@@ -199,7 +199,7 @@ def main():
         local.until(lambda:api().get('maxWriteBytes')==MiB,seconds=20);return p
     def mount_fixture():
         assert not local.is_mounted(mount)
-        options=f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,nodev,nosuid,wsize=1048576,rsize=1048576,acregmin=0,acregmax=1'
+        options=f'port={nfs},mountport={nfs},tcp,vers=3,nolocks,mutejukebox,nodev,nosuid,wsize=1048576,rsize=1048576,acregmin=0,acregmax=1'
         if args.faults_only:options+=',soft,timeo=10,retrans=1'
         local.command(['/sbin/mount_nfs','-o',options,'127.0.0.1:/',str(mount)])
     def sample(peaks):
